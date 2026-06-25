@@ -998,7 +998,14 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
 
     if name == "place_call":
         raw_to = (args.get("to") or "").strip()
+        had_plus = raw_to.startswith("+")
         digits = "".join(ch for ch in raw_to if ch.isdigit())
+        # The model / web-search results often give a US number with no country
+        # code (e.g. "415-362-8342"), which would build the invalid "+4153628342".
+        # Coerce a bare 10-digit number to +1. A leading '+' means a full
+        # international number was supplied — trust it as-is.
+        if not had_plus and len(digits) == 10:
+            digits = "1" + digits
         task = (args.get("task") or "").strip()
         business = (args.get("business_name") or "").strip()
         # Receipt so place_call is debuggable from the logs (like web_search):
