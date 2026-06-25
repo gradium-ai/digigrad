@@ -1979,6 +1979,16 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     # margin for the answer's first frames.
     tool_window = {"until": 0.0}
     tool_window_s = _env_float("TOOL_BARGE_SUPPRESS_S", 12.0)
+    # Duplicate-answer guard: gemma sometimes emits a SECOND answer turn right
+    # after the first post-tool answer (e.g. two different weather readings from
+    # one web_search). We arm when a tool finishes, count agent turns, and drop
+    # the audio of any extra turn that starts within dup_answer_window_s of the
+    # first answer — so the caller hears exactly one answer. A genuine follow-up
+    # ("anything else?") comes later, outside the window, and is unaffected.
+    post_tool = {"armed": False, "armed_at": 0.0, "answers": 0, "first_answer_at": 0.0}
+    dup_drop = {"v": False}
+    dup_answer_window_s = _env_float("DUP_ANSWER_WINDOW_S", 3.0)
+    dup_arm_max_s = _env_float("DUP_ANSWER_ARM_MAX_S", 15.0)
 
     async def _maybe_play_filler() -> None:
         await asyncio.sleep(_FILLER_DELAY_S)
@@ -2062,9 +2072,31 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     # Otherwise play normally — no interruption, or one suppressed
                     # inside the guard window. Track turn boundaries: a >0.5s gap
                     # since the last agent frame marks the start of a new turn.
-                    if not agent_turn["start"] or (now - agent_turn["last"]) > 0.5:
+                    new_turn = (not agent_turn["start"]) or (now - agent_turn["last"]) > 0.5
+                    if new_turn:
                         agent_turn["start"] = now
+                        # Duplicate-answer classification (see post_tool note).
+                        if post_tool["armed"] and (now - post_tool["armed_at"]) <= dup_arm_max_s:
+                            if post_tool["answers"] == 0:
+                                post_tool["answers"] = 1
+                                post_tool["first_answer_at"] = now
+                                dup_drop["v"] = False
+                            elif (now - post_tool["first_answer_at"]) < dup_answer_window_s:
+                                dup_drop["v"] = True  # extra answer turn → drop it
+                                log.info("call %s | suppressed duplicate post-tool answer turn",
+                                         state.room_name)
+                                _log_event(state, "dup_answer_suppressed")
+                            else:
+                                post_tool["armed"] = False
+                                dup_drop["v"] = False
+                        else:
+                            post_tool["armed"] = False
+                            dup_drop["v"] = False
                     agent_turn["last"] = now
+                    # Drop the audio of a suppressed duplicate answer turn so the
+                    # caller never hears the second, conflicting reply.
+                    if dup_drop["v"]:
+                        continue
                     awaiting_response["v"] = False
                     filler_used_this_turn["v"] = False
                     if state.first_agent_audio_at is None:
@@ -2103,6 +2135,10 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                         log.info("call %s | CALLER: %s", state.room_name, text)
                         await _append_transcript(state, "CALLER", f"[{state.spec.language}] {text}")
                         state.transcript_turns.append(("caller", text))
+                        # New caller turn — disarm the duplicate-answer guard so a
+                        # fresh question's answer is never mistaken for a duplicate.
+                        post_tool["armed"] = False
+                        dup_drop["v"] = False
                         # Caller just spoke — agent reply is pending. Arm a
                         # filler to cover the think-gap (no-op unless enabled).
                         if fillers_on:
@@ -2142,6 +2178,16 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     task = asyncio.create_task(_handle_tool_call(handle, state, emit_event))
                     pending_tool_tasks.add(task)
                     task.add_done_callback(pending_tool_tasks.discard)
+
+                    # Arm the duplicate-answer guard: count agent turns from here
+                    # so a second, conflicting answer to the same tool result is
+                    # dropped (see post_tool note).
+                    def _arm_post_tool(_t: asyncio.Task) -> None:
+                        post_tool["armed"] = True
+                        post_tool["armed_at"] = time.monotonic()
+                        post_tool["answers"] = 0
+                        post_tool["first_answer_at"] = 0.0
+                    task.add_done_callback(_arm_post_tool)
 
                 # If the LLM called end_business_call, stop the consumer too.
                 if state.end_requested:
