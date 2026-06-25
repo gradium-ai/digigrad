@@ -266,12 +266,76 @@ def _web_search_tool_def() -> Any:
     )
 
 
+def _place_call_tool_def() -> Any:
+    """Let the assistant dispatch a NEW outbound call on the caller's behalf.
+
+    This is what turns "call the cafe and order a matcha latte" into an
+    actual phone call: a second gradbot agent dials the business in the
+    caller's cloned voice, carries out the task, and the result is texted
+    back to the caller's Telegram by _post_call_followups. The assistant
+    does NOT stay on the line for it — it fires the call and moves on.
+    """
+    return gradbot.ToolDef(
+        name="place_call",
+        description=(
+            "Place a NEW outbound phone call on the caller's behalf and have a "
+            "second agent — speaking in the caller's own cloned voice — carry out "
+            "a task on that call. Use this WHENEVER the caller asks you to 'call "
+            "X and …' (e.g. call a cafe to order a matcha latte, call a restaurant "
+            "to ask about availability, call a shop to check stock). If you don't "
+            "already know the number, look it up FIRST with web_search (search for "
+            "the business name plus 'phone number'), then call this. You do NOT "
+            "stay on the line — the call runs in the background and its result is "
+            "texted to the caller on Telegram. After calling this tool, tell the "
+            "caller you're placing the call now and will text them the result."
+        ),
+        parameters_json=json.dumps({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": (
+                        "Destination phone number in E.164 (e.g. +14155551234). "
+                        "Look it up with web_search first if you don't have it."
+                    ),
+                },
+                "task": {
+                    "type": "string",
+                    "description": (
+                        "What the calling agent should accomplish, in one or two "
+                        "sentences — e.g. 'Ask if they have matcha lattes and order "
+                        "one for pickup under the name Pratim.'"
+                    ),
+                },
+                "business_name": {
+                    "type": "string",
+                    "description": "Name of the business being called, if known (e.g. 'Blue Bottle Coffee').",
+                },
+                "allow_booking": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true when the task involves placing an order, booking, "
+                        "or reserving. Leave false for information-only calls."
+                    ),
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Call language as an ISO code (en, fr, pt). Defaults to this call's language.",
+                },
+            },
+            "required": ["to", "task"],
+        }),
+    )
+
+
 def _assistant_tool_defs() -> list[Any]:
-    """Tools for assistant mode (free personal call): email + memory + web + hang up."""
+    """Tools for assistant mode (free personal call): email + memory + web +
+    place outbound call + hang up."""
     if not HAS_GRADBOT:
         return []
     return _memory_tool_defs() + [
         _web_search_tool_def(),
+        _place_call_tool_def(),
         gradbot.ToolDef(
             name="get_email_summary",
             description=(
@@ -484,6 +548,7 @@ def _timeline_event(state: _CallState, name: str, **extra: object) -> None:
         "business_prompt_build": "system",
         "email_summary": "tool_call",
         "web_search": "tool_call",
+        "place_call": "tool_call",
         "take_message": "tool_call",
         "remember": "tool_call",
         "recall": "tool_call",
@@ -930,6 +995,68 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         _timeline_event(state, "take_message", caller=who[:80], delivered=delivered)
         await _append_transcript(state, "MESSAGE-TAKEN", f"{who}: {message}")
         await handle.send_json({"success": True, "delivered": delivered})
+        return
+
+    if name == "place_call":
+        raw_to = (args.get("to") or "").strip()
+        digits = "".join(ch for ch in raw_to if ch.isdigit())
+        task = (args.get("task") or "").strip()
+        if not digits:
+            await handle.send_error(
+                "Refused: no valid phone number. Look the business up with web_search "
+                "first, then call place_call with its number in E.164 (e.g. +1…)."
+            )
+            return
+        if not task:
+            await handle.send_error("Refused: no task — say what the call should accomplish.")
+            return
+        to = "+" + digits
+        if not _outbound_destination_allowed(to):
+            _timeline_event(state, "place_call", to=to, error="not_allowed")
+            await handle.send_json({
+                "success": False,
+                "error": "That number isn't on the allowed list for outbound calls — "
+                         "tell the caller you can't dial it right now.",
+            })
+            return
+        # Reserve a rate-limit slot for the NEW call, mirroring /dial. The
+        # sub-call's own websocket finally releases it when that call ends.
+        if state.tenant_id is not None:
+            ok, reason = await ratelimit.reserve(state.tenant_id)
+            if not ok:
+                _timeline_event(state, "place_call", to=to, error="rate_limited")
+                await handle.send_json({"success": False, "error": reason})
+                return
+        lang = (args.get("language") or state.spec.language or "en").lower()
+        sub_spec = BusinessCallSpec(
+            task=task,
+            language=lang,
+            business_name=(args.get("business_name") or "").strip(),
+            destination=to,
+            allow_booking=bool(args.get("allow_booking", False)),
+            mode="business",
+        )
+        out = await dispatch_gradbot_call(to=to, spec=sub_spec, tenant_id=state.tenant_id)
+        if isinstance(out, str) and out.startswith("Error:"):
+            if state.tenant_id is not None:
+                ratelimit.release(state.tenant_id)
+            _timeline_event(state, "place_call", to=to, error=out[:120])
+            await handle.send_json({
+                "success": False,
+                "error": "Couldn't place the call — tell the caller it didn't go through.",
+            })
+            return
+        _timeline_event(
+            state, "place_call", to=to, room=out,
+            business=sub_spec.business_name[:80] or task[:80],
+        )
+        await _append_transcript(state, "PLACE-CALL", f"{to} — {task}")
+        await handle.send_json({
+            "success": True,
+            "room": out,
+            "note": "Call placed; it's running in the background and the result will be "
+                    "texted to the caller on Telegram. Tell the caller it's on its way.",
+        })
         return
 
     if name == "hang_up":
