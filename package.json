@@ -1,0 +1,13 @@
+{
+  "name": "digigrad-setup",
+  "private": true,
+  "type": "module",
+  "description": "Workshop attendee setup — namespace Render Blueprint resource names.",
+  "scripts": {
+    "setup": "node scripts/setup-attendee.js",
+    "test:setup": "node --test tests/setup-attendee.test.js"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  }
+}

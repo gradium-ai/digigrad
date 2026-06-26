@@ -103,15 +103,27 @@ No local install. You get a stable public URL automatically, which Twilio needs.
 > **Use a paid (Starter) instance.** The free tier sleeps after inactivity and
 > would drop calls. ~$7/month.
 
-### Step 1 — Get the code into your own repo
-- **Fork** this repository to your own GitHub account (GitHub → Fork), or push a
-  copy to a repo you control. Render deploys from a GitHub repo you own.
+### Step 1 — Fork this repo
+- **Fork** this repository to your own GitHub account (GitHub → Fork). Render
+  deploys from a GitHub repo you own.
 
-### Step 2 — Create the service from the Blueprint
+### Step 2 — Namespace your Blueprint (workshops / shared workspaces)
+If multiple people deploy from the same workshop repo, each person needs unique
+Render resource names so Blueprints do not collide.
+
+1. On your fork, open **Actions → Setup attendee Blueprint names → Run workflow**.
+2. Wait for the workflow to commit a namespaced `render.yaml` to your fork (resource
+   names are prefixed with your GitHub username, e.g. `yourname-gradphone`).
+3. **Local alternative:** `npm install && npm run setup -- your-github-username`,
+   then commit and push `render.yaml`.
+
+Skip this step if you are the only person deploying from your fork.
+
+### Step 3 — Create the Render Project from the Blueprint
 1. Create an account at **render.com** and connect your GitHub.
 2. Click **New → Blueprint**, and select your forked repo.
-3. Render reads the included **`render.yaml`** and sets up one always-on web
-   service with a small disk. It will **prompt you for the secret values** — paste
+3. Render reads **`render.yaml`** and creates a **Project** with one always-on web
+   service and a persistent disk. It will **prompt you for the secret values** — paste
    the keys you collected above:
    - `TELEGRAM_BOT_TOKEN`, `GRADIUM_API_KEY`, `GRADIUM_BASE_URL` (if provided),
      `LLM_BASE_URL`, `LLM_MODEL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
@@ -124,7 +136,7 @@ No local install. You get a stable public URL automatically, which Twilio needs.
      tuning, and `TWILIO_MACHINE_DETECTION=Disable`) come from `render.yaml`
      automatically — you don't type those.
 
-### Step 3 — Note your public URL
+### Step 4 — Note your public URL
 When the deploy is live, your service has a URL like
 `https://<your-service>.onrender.com`. The app fills in `PUBLIC_HTTP_URL` /
 `PUBLIC_WS_URL` from it automatically — you don't set those.
@@ -132,7 +144,7 @@ When the deploy is live, your service has a URL like
 Check it's up: open `https://<your-service>.onrender.com/healthz` — you should see
 `{"status":"ok","gradbot_installed":true,…}`.
 
-### Step 4 — Point your Twilio number at the app
+### Step 5 — Point your Twilio number at the app
 In the Twilio Console → **Phone Numbers → your number → Voice configuration**:
 - Set **"A call comes in"** to **Webhook**, URL:
   `https://<your-service>.onrender.com/twilio/voice`, method **HTTP POST**. Save.

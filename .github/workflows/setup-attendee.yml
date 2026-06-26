@@ -1,0 +1,50 @@
+name: Setup attendee Blueprint names
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    name: Namespace Render Blueprint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refuse upstream main
+        if: ${{ (github.repository_owner == 'ojusave' || github.repository_owner == 'gradium-ai') && github.ref_name == 'main' }}
+        run: |
+          echo "This setup workflow is for attendee forks."
+          echo "Refusing to namespace Blueprint on ${GITHUB_REPOSITORY} main."
+          exit 1
+
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install setup dependencies
+        run: npm ci
+
+      - name: Namespace Blueprint resources
+        run: npm run setup
+
+      - name: Commit namespaced Blueprint
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add render.yaml
+
+          if git diff --cached --quiet; then
+            echo "Blueprint is already namespaced for ${GITHUB_ACTOR}."
+            exit 0
+          fi
+
+          git commit -m "Namespace Render resources for ${GITHUB_ACTOR}"
+          git push

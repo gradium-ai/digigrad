@@ -3,7 +3,10 @@
 # Render Blueprint — one gradphone clone (bridge + bot) as a single always-on
 # Web Service. One deployment per person.
 #
-# Deploy: Render Dashboard → New → Blueprint → connect this repo. Render creates
+# Workshop: after forking, run the "Setup attendee Blueprint names" GitHub Action
+# (or `npm run setup`) so resource names are prefixed with your GitHub username.
+#
+# Deploy: Render Dashboard → New → Blueprint → connect your fork. Render creates
 # a Project and prompts for the `sync: false` secrets below. After deploy, point
 # your Twilio number's Voice webhook at https://<your-service>.onrender.com/twilio/voice.
 
