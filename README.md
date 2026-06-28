@@ -175,10 +175,6 @@ curl http://localhost:8082/healthz
 # {"status":"ok","gradbot_installed":true,...}
 ```
 
-> **Deploying instead of running locally?** Render gives you a stable public URL
-> with no local install via the included `render.yaml` — see
-> [RENDER.md](RENDER.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
-
 ---
 
 ## First use, in Telegram
