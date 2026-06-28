@@ -178,6 +178,29 @@ info "installing gradphone + dependencies (editable; pulls gradbot from PyPI)…
 "$VPY" -m pip install -e . >/dev/null
 ok "dependencies installed"
 
+# macOS: clear any UF_HIDDEN flag on the venv. Some macOS tools/daemons mark
+# dot-dirs (.venv) hidden, and CPython's site.py SILENTLY SKIPS hidden .pth
+# files — which makes the editable install's gradphone.* modules unimportable.
+[ "$PLAT" = macos ] && chflags -R nohidden "$VENV" 2>/dev/null || true
+
+# Verify the package imports the same way run_local.sh launches it (src on
+# PYTHONPATH). We import the package, not gradphone.bridge — the latter loads
+# config and needs the external keys you haven't added to .env yet.
+if ! PYTHONPATH="$REPO_ROOT/src" "$VPY" -c "import gradphone" >/dev/null 2>&1; then
+  die "gradphone is not importable after install. Debug with:
+       PYTHONPATH=src $VENV/bin/python -c 'import gradphone'"
+fi
+ok "verified: gradphone imports cleanly"
+
+# Non-fatal: if the editable install (the .pth) isn't honored but the check
+# above passed, a background tool is flagging .venv hidden. run_local.sh sets
+# PYTHONPATH=src so the app still runs; this just flags the shell-import gap.
+if ! "$VPY" -c "import gradphone" >/dev/null 2>&1; then
+  warn "editable .pth isn't being honored (a background tool keeps flagging"
+  warn "$VENV hidden). run_local.sh handles this via PYTHONPATH and works fine."
+  warn "to fix bare 'python -c \"import gradphone\"' too: chflags -R nohidden $VENV"
+fi
+
 # ---------- .env scaffold ----------
 step "Configuration (${ENV_FILE})"
 if [ -f "$ENV_FILE" ]; then
@@ -227,8 +250,8 @@ Then start everything with one command:
 It starts the tunnel, writes PUBLIC_* into .env, points your Twilio number's
 voice webhook at the tunnel, then launches the bridge + Telegram bot.
 
-(Manual alternative — three terminals:
+(Manual alternative — three terminals, from the repo root:
    ${CF} tunnel --url http://localhost:8082
-   ${VENV}/bin/uvicorn gradphone.bridge:app --host 0.0.0.0 --port 8082
-   ${VENV}/bin/python -m gradphone.bot )
+   PYTHONPATH=src ${VENV}/bin/uvicorn gradphone.bridge:app --host 0.0.0.0 --port 8082
+   PYTHONPATH=src ${VENV}/bin/python -m gradphone.bot )
 EOF

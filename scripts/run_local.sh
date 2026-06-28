@@ -23,6 +23,13 @@ BOT_LOG=/tmp/gradphone_bot.log
 [ -x "$VENV/bin/python" ]   || { echo "no $VENV — run scripts/setup.sh first"; exit 1; }
 VPY="$VENV/bin/python"
 
+# Make the gradphone package importable regardless of how the editable install
+# landed. On macOS some tools flag .venv as hidden, and CPython's site.py
+# SILENTLY SKIPS hidden .pth files — which would make `import gradphone` fail at
+# launch. Putting src on PYTHONPATH sidesteps that entirely and also wins over
+# any stale namespace dir in site-packages.
+export PYTHONPATH="$REPO_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
 CF="$(command -v cloudflared || true)"
 [ -n "$CF" ] || CF="./.tools/cloudflared"
 [ -x "$CF" ] || { echo "cloudflared not found — run scripts/setup.sh first"; exit 1; }

@@ -143,19 +143,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # the filler block in twilio_stream. Off unless ENABLE_FILLERS is set.
 _FILLER_PHRASE = os.environ.get("FILLER_PHRASE", "Mm, let me see.")
 _FILLER_DELAY_S = _env_float("FILLER_DELAY_S", 0.7)
-_FILLER_CACHE: dict[str, bytes] = {}
+_TTS_ULAW_CACHE: dict[tuple[str, str], bytes] = {}
 
 
-async def _render_filler_ulaw(voice_id: str) -> bytes | None:
-    """Synthesize the filler phrase in ``voice_id`` and return it as 8 kHz
-    μ-law (Twilio's wire format). Cached per voice, so it costs exactly one
-    Gradium TTS call per voice for the life of the process. Best-effort —
-    returns None on any failure (missing key, TTS error) so a filler never
-    breaks a call."""
-    if not voice_id:
+async def _render_text_ulaw(voice_id: str, text: str) -> bytes | None:
+    """Synthesize text and return 8 kHz μ-law for Twilio Media Streams."""
+    text = (text or "").strip()
+    if not voice_id or not text:
         return None
-    if voice_id in _FILLER_CACHE:
-        return _FILLER_CACHE[voice_id]
+    cache_key = (voice_id, text)
+    if cache_key in _TTS_ULAW_CACHE:
+        return _TTS_ULAW_CACHE[cache_key]
     try:
         import audioop
         import io
@@ -172,7 +170,7 @@ async def _render_filler_ulaw(voice_id: str) -> bytes | None:
             if base_url else gradium.GradiumClient(api_key=api_key)
         )
         setup = gradium.TTSSetup(model_name="default", voice_id=voice_id, output_format="wav")
-        result = await client.tts(setup, _FILLER_PHRASE)
+        result = await client.tts(setup, text)
         wav = getattr(result, "raw_data", None)
         if not wav:
             return None
@@ -184,11 +182,16 @@ async def _render_filler_ulaw(voice_id: str) -> bytes | None:
         if rate != TWILIO_ULAW_RATE:
             pcm, _ = audioop.ratecv(pcm, 2, 1, rate, TWILIO_ULAW_RATE, None)
         ulaw = audioop.lin2ulaw(pcm, 2)
-        _FILLER_CACHE[voice_id] = ulaw
+        _TTS_ULAW_CACHE[cache_key] = ulaw
         return ulaw
     except Exception as exc:  # noqa: BLE001
-        log.warning("filler render failed: %s", exc)
+        log.warning("TTS render failed: %s", exc)
         return None
+
+
+async def _render_filler_ulaw(voice_id: str) -> bytes | None:
+    """Synthesize the filler phrase in ``voice_id`` for Twilio playback."""
+    return await _render_text_ulaw(voice_id, _FILLER_PHRASE)
 
 
 # --- Tool defs -----------------------------------------------------------
@@ -523,6 +526,7 @@ class _CallState:
     # track with silence so the stereo mix stays time-aligned.
     first_caller_audio_at: float | None = None
     first_agent_audio_at: float | None = None
+    stream_started_at: float | None = None
     # Rolling buffer of structured events (last ~30) for the dashboard's
     # Live Calls feed. Each entry: {t, type, ...fields}. type ∈
     # {agent_text, caller_text, state_change, tool_call, system, ringing,
@@ -652,7 +656,7 @@ def _make_session_config(
         instructions = build_receptionist_prompt(spec, owner_name=owner)
         tools = _receptionist_tool_defs()
     else:
-        instructions = build_business_prompt(spec, opener_already_spoken=False)
+        instructions = build_business_prompt(spec, opener_already_spoken=True)
         tools = _tool_defs()
     return gradbot.SessionConfig(
         voice_id=voice_id,
@@ -674,14 +678,6 @@ def _make_session_config(
         # Both env-tunable, no redeploy.
         silence_timeout_s=_env_float("GRADBOT_SILENCE_TIMEOUT_S", 8.0),
         flush_duration_s=_env_float("GRADBOT_FLUSH_DURATION_S", 0.5),
-        # Speak ~20% faster than default. Two knobs:
-        #   - padding_bonus negative shrinks inter-token pause time
-        #     (LiveKit's business mode uses -1.0 for "slightly brisker";
-        #     -2.0 here is more aggressive).
-        #   - tts_extra_config.speed is Gradium TTS's rate multiplier
-        #     (1.2 = 20% faster word-rate).
-        padding_bonus=-2.0,
-        tts_extra_config=json.dumps({"speed": 1.1}),
         # STT-side endpointing padding (Gradium ASR json_config). Per Gradium's
         # "Transcription Settings" docs, padding_bonus (range -4..4) biases the
         # model to finalize the caller's turn SOONER (negative) or LATER
@@ -695,19 +691,11 @@ def _make_session_config(
         stt_extra_config=json.dumps(
             {"padding_bonus": _env_float("GRADBOT_STT_PADDING_BONUS", 1.5)}
         ),
-        # Disable model "reasoning". gpt-5.x on OpenRouter defaults to reasoning
-        # effort = medium when the request omits a `reasoning` field, which adds
-        # slow hidden think-turns before every reply — bad for a realtime voice
-        # agent (latency) and it bills extra output tokens. gradbot forwards
-        # llm_extra_config into the chat-completions body, so this becomes
-        # OpenRouter's top-level `reasoning` param. Use effort=minimal as the
-        # GPT-5 floor if a model rejects enabled=false.
-        llm_extra_config=json.dumps({"reasoning": {"enabled": False}}),
         # First-turn behaviour: assistant speaks first so we play the
         # courtesy opener before the callee says anything. The prompt's
         # turn-1 rules tell the LLM to lead with the brief courteous
         # opener exactly like the LiveKit path's cached opener.
-        assistant_speaks_first=True,
+        assistant_speaks_first=(mode != "business"),
     )
 
 
@@ -1652,6 +1640,72 @@ async def twilio_status(request: fastapi.Request):
     return {"ok": True}
 
 
+@app.post("/twilio/stream-status")
+async def twilio_stream_status(request: fastapi.Request):
+    """Twilio Media Streams status callback.
+
+    Captures stream-started / stream-stopped / stream-error callbacks for the
+    bidirectional <Connect><Stream>. These callbacks are the only place Twilio
+    includes StreamError detail when it closes a Media Stream unexpectedly.
+    """
+    params = await _verified_twilio_form(request)
+
+    room = request.query_params.get("room", "")
+    if room:
+        room = _safe_room(room)
+
+    stream_event = params.get("StreamEvent", "")
+    stream_error = params.get("StreamError", "")
+    stream_sid = params.get("StreamSid", "")
+    call_sid = params.get("CallSid", "")
+    payload = {
+        "call_sid": call_sid,
+        "stream_sid": stream_sid,
+        "stream_event": stream_event,
+        "stream_error": stream_error,
+        "raw": dict(params),
+    }
+
+    if room:
+        rec_dir = RECORDINGS_ROOT / room
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        sidecar = rec_dir / "twilio_stream_status.json"
+        try:
+            existing = json.loads(sidecar.read_text()) if sidecar.exists() else []
+            if not isinstance(existing, list):
+                existing = [existing]
+        except (OSError, json.JSONDecodeError):
+            existing = []
+        existing.append(payload)
+        try:
+            sidecar.write_text(json.dumps(existing, indent=2))
+        except OSError as e:
+            log.warning("twilio_stream_status sidecar write failed: %s", e)
+
+        async with _PENDING_LOCK:
+            state = _PENDING.get(room) or _ACTIVE.get(room)
+        if state is not None:
+            _log_event(
+                state,
+                "stream_status",
+                stream_event=stream_event,
+                stream_sid=stream_sid,
+                stream_error=stream_error,
+            )
+
+    if stream_error:
+        log.warning(
+            "twilio stream status: room=%s event=%s sid=%s error=%s",
+            room or "-", stream_event, stream_sid, stream_error,
+        )
+    else:
+        log.info(
+            "twilio stream status: room=%s event=%s sid=%s",
+            room or "-", stream_event, stream_sid,
+        )
+    return {"ok": True}
+
+
 def _twilio_status_to_business_status(call_status: str, answered_by: str) -> str:
     if answered_by.startswith("machine") or answered_by == "fax":
         return "voicemail"
@@ -1896,12 +1950,17 @@ async def twilio_voice(request: fastapi.Request):
         # Fall back to the request host (works behind a single tunnel).
         host = request.headers.get("x-forwarded-host") or request.url.hostname
         public_ws = f"wss://{host}"
+    public_http = os.environ.get("PUBLIC_HTTP_URL", "").rstrip("/")
+    if not public_http:
+        host = request.headers.get("x-forwarded-host") or request.url.hostname
+        public_http = f"https://{host}"
     ws_url = f"{public_ws}/twilio/stream"
+    stream_status_url = f"{public_http}/twilio/stream-status?room={room}"
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<Response>'
         '  <Connect>'
-        f'    <Stream url="{ws_url}">'
+        f'    <Stream url="{ws_url}" statusCallback="{stream_status_url}" statusCallbackMethod="POST">'
         f'      <Parameter name="room" value="{room}"/>'
         '    </Stream>'
         '  </Connect>'
@@ -1978,6 +2037,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     _log_event(state, "connected", stream_sid=stream_sid)
 
     state.stream_sid = stream_sid
+    state.stream_started_at = time.monotonic()
     log.info("twilio_stream: bridge starting room=%s sid=%s", room, stream_sid)
     await _append_transcript(state, "SYSTEM", f"📤 Outbound call (gradbot) — room: {room}")
     # Emit business_prompt_build so the dashboard's discover_business_rooms()
@@ -2094,6 +2154,49 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     dup_answer_window_s = _env_float("DUP_ANSWER_WINDOW_S", 6.0)
     dup_arm_max_s = _env_float("DUP_ANSWER_ARM_MAX_S", 15.0)
 
+    async def _send_agent_ulaw(ulaw_8k: bytes, *, log_type: str = "agent_audio") -> None:
+        if not ulaw_8k:
+            return
+        now = time.monotonic()
+        if state.first_agent_audio_at is None:
+            state.first_agent_audio_at = now
+        agent_turn["start"] = agent_turn["start"] or now
+        agent_turn["last"] = now
+        await websocket.send_text(json.dumps({
+            "event": "media",
+            "streamSid": state.stream_sid,
+            "media": {"payload": base64.b64encode(ulaw_8k).decode("ascii")},
+        }))
+        if state.wav_agent is not None:
+            try:
+                expected = int((now - state.first_agent_audio_at) * TWILIO_ULAW_RATE)
+                gap_samples = expected - state.agent_samples_written
+                if gap_samples > 0:
+                    state.wav_agent.writeframes(b"\x00\x00" * gap_samples)
+                    state.agent_samples_written += gap_samples
+                chunk_pcm = _ulaw_to_pcm16(ulaw_8k)
+                state.wav_agent.writeframes(chunk_pcm)
+                state.agent_samples_written += len(chunk_pcm) // 2
+            except Exception as e:  # noqa: BLE001
+                log.debug("wav agent write failed: %s", e)
+        _log_event(state, log_type)
+
+    async def _play_business_opener() -> None:
+        if (state.spec.mode or "business").lower() != "business":
+            return
+        opener = build_opener_text(state.spec)
+        ulaw = await _render_text_ulaw(call_voice_id, opener)
+        if not ulaw:
+            log.warning("business opener render returned no audio for room=%s", state.room_name)
+            return
+        await _send_agent_ulaw(ulaw, log_type="opener")
+        log.info("call %s | AGENT: %s", state.room_name, opener)
+        await _append_transcript(state, "AGENT", opener)
+        state.transcript_turns.append(("agent", opener))
+        if not state.first_agent_seen:
+            state.first_agent_seen = True
+            _timeline_event(state, "business_first_agent_text", text=opener[:160])
+
     async def _maybe_play_filler() -> None:
         await asyncio.sleep(_FILLER_DELAY_S)
         if not awaiting_response["v"] or filler_used_this_turn["v"] or stop_event.is_set():
@@ -2106,14 +2209,11 @@ async def twilio_stream(websocket: fastapi.WebSocket):
             return
         filler_used_this_turn["v"] = True
         try:
-            await websocket.send_text(json.dumps({
-                "event": "media",
-                "streamSid": state.stream_sid,
-                "media": {"payload": base64.b64encode(ulaw).decode("ascii")},
-            }))
-            _log_event(state, "filler")
+            await _send_agent_ulaw(ulaw, log_type="filler")
         except Exception:  # noqa: BLE001
             pass
+
+    await _play_business_opener()
 
     if fillers_on:
         # Pre-warm so the first gap can use it too. Fire-and-forget.
@@ -2145,6 +2245,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
             while not stop_event.is_set():
                 msg = await output_handle.receive()
                 if msg is None:
+                    log.warning("gradbot output closed for room=%s", state.room_name)
                     return
                 kind = getattr(msg, "msg_type", None)
 
@@ -2208,28 +2309,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     ulaw_8k, agent_resample_state = _resample_ulaw(
                         msg.data, GRADBOT_OUTPUT_RATE, TWILIO_ULAW_RATE, agent_resample_state,
                     )
-                    payload_b64 = base64.b64encode(ulaw_8k).decode("ascii")
-                    await websocket.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": state.stream_sid,
-                        "media": {"payload": payload_b64},
-                    }))
-                    if state.wav_agent is not None:
-                        try:
-                            # Gap-fill: emit silence to bring the wav up to
-                            # the wall-clock position before writing this
-                            # chunk, so between-turn pauses are preserved.
-                            now = time.monotonic()
-                            expected = int((now - state.first_agent_audio_at) * TWILIO_ULAW_RATE)
-                            gap_samples = expected - state.agent_samples_written
-                            if gap_samples > 0:
-                                state.wav_agent.writeframes(b"\x00\x00" * gap_samples)
-                                state.agent_samples_written += gap_samples
-                            chunk_pcm = _ulaw_to_pcm16(ulaw_8k)
-                            state.wav_agent.writeframes(chunk_pcm)
-                            state.agent_samples_written += len(chunk_pcm) // 2
-                        except Exception as e:  # noqa: BLE001
-                            log.debug("wav agent write failed: %s", e)
+                    await _send_agent_ulaw(ulaw_8k)
 
                 elif kind == "stt_text":
                     text = (getattr(msg, "text", "") or "").strip()
@@ -2341,10 +2421,18 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     #    cannot interrupt on audio it never receives. agent_turn
                     #    is set by the consumer when a new agent turn begins.
                     now_p = time.monotonic()
-                    opener_guard = (
-                        state.first_agent_audio_at is None
-                        or (now_p - state.first_agent_audio_at) < state.opener_guard_seconds
-                    )
+                    # Suppress caller audio only for a bounded opener window. If
+                    # assistant_speaks_first fails to produce audio, an unbounded
+                    # guard deadlocks the call: the agent waits for user audio,
+                    # while the bridge refuses to forward user audio until agent
+                    # audio exists.
+                    if state.first_agent_audio_at is None:
+                        stream_age = now_p - (state.stream_started_at or now_p)
+                        opener_guard = stream_age < state.opener_guard_seconds
+                    else:
+                        opener_guard = (
+                            now_p - state.first_agent_audio_at
+                        ) < state.opener_guard_seconds
                     turn_guard = bool(
                         agent_turn["start"]
                         and (now_p - agent_turn["start"]) < barge_guard_s
