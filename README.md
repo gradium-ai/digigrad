@@ -1,7 +1,7 @@
 # Gradphone: A voice agent that acts as your clone.
 
 Clone your own voice once, then get your clone to do things for you. 
-From Telegram you can text it, send it voice notes (it replies in *your* voice), translate, and it remembers you across conversations. Over the phone your clone can **call you** (`/callme`) and **answer your number** — you reach your own assistant, while anyone else
+From Telegram you can text it, send it voice notes (it replies in *your* voice), translate, and it remembers you across conversations. Over the phone your clone can **call you** (`/callme`) and **answer your number** where you'll reach your own assistant, while anyone else
 reaches an AI receptionist that takes a message. On calls it can also **search the
 web** and **summarize your email**.
 
@@ -17,7 +17,7 @@ One small Python service runs two processes against a shared SQLite database:
 | **Gradium** | Voice cloning, STT, and TTS — what makes the clone sound like you. |
 | **LLM** | Any OpenAI-compatible endpoint (OpenAI, Groq, a local model, …) — generates replies. |
 | **Twilio** | Phone calls in and out. A voice webhook points at your app. |
-| **Telegram bot** | Your chat interface — onboarding, text/voice chat, and commands. |
+| **Telegram bot** | Your chat interface for onboarding, text/voice chat, and commands. |
 | **bridge** | FastAPI service handling Twilio calls + the internal API (port 8082). |
 
 **On Telegram:** `bot → Gradium STT → LLM → Gradium TTS → reply`, with facts
@@ -41,7 +41,7 @@ the deeper design.
 |---|---|
 | Clone your voice | Send a 15–30s voice note on Telegram |
 | Text chat | Type to the bot — it replies in text |
-| Voice-note chat | Send a voice note — it replies in *your* voice |
+| Voice-note chat | Send a voice note, it'll replies in *your* voice |
 | Translate | `/translate`, pick a language, send a voice note — hear it back in your voice |
 | Remembers you | Tell it facts ("I'm vegetarian"); it recalls them later |
 | Calls you (`/callme`) | It phones you and talks in your voice |
@@ -93,8 +93,7 @@ You'll sign up for four services. Here's each key and how to get it.
 
 **LLM provider** — the "brain" · *required*
 
-Any OpenAI-compatible endpoint; OpenAI is simplest. Create a key at
-**platform.openai.com**, add a small balance, then set **all three**:
+Any OpenAI-compatible endpoint;
 
 ```
 LLM_BASE_URL=https://api.openai.com/v1
@@ -126,7 +125,7 @@ A free trial is enough for `/callme` to your own phone.
 4. Get your **trial phone number** (Console → Phone Numbers) → `TWILIO_PHONE_NUMBER`.
 
 > **Trial limits:** calls play a short "press any key" preamble and can only dial
-> numbers you've verified — fine for `/callme`. To call any number with no
+> numbers you've verified which is fine for `/callme`. To call any number with no
 > preamble, **upgrade to paid** (add a card). Nothing else changes.
 
 **Optional add-ons** (leave blank to skip): `LINKUP_API_KEY` (web search, from
@@ -217,7 +216,7 @@ curl http://localhost:8082/healthz
 | `LLM_BASE_URL / LLM_MODEL not set` | You set only `OPENAI_API_KEY` — set all three (Setup §2). |
 | Voice notes fail | ffmpeg isn't installed — re-run `scripts/setup.sh`. |
 | Call connects then drops in seconds | Twilio AMD misread "hello" as voicemail — keep `TWILIO_MACHINE_DETECTION=Disable`. |
-| You call in but get the receptionist | Your caller ID isn't linked — share your contact (First use §2). |
+| You call in but get the receptionist | Your caller ID isn't linked, share your contact (First use §2). |
 | "press any key" on a call | The Twilio trial preamble — upgrade to paid to remove it. |
 
 ---
