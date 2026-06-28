@@ -1,322 +1,260 @@
-# gradphone — your voice digital clone
+# Gradphone: A voice agent that acts as your clone.
 
-Clone your voice once, then **talk to your clone** — by text or voice note on
-Telegram, or on a real phone call. Your clone can **call you** (`/callme`) and
-chat in your own voice, **answer your phone number** (you reach your assistant;
-anyone else reaches an AI receptionist that takes a message), remember things
-about you across conversations, **search the live web**, and **summarize your
-email**.
+Clone your own voice once, then get your clone to do things for you. 
+From Telegram you can text it, send it voice notes (it replies in *your* voice), translate, and it remembers you across conversations. Over the phone your clone can **call you** (`/callme`) and **answer your number** — you reach your own assistant, while anyone else
+reaches an AI receptionist that takes a message. On calls it can also **search the
+web** and **summarize your email**.
 
-Built on the **gradbot** framework (speech-to-text → LLM → text-to-speech) wired
-to **Twilio** for phone calls and **Telegram** for chat. One small service runs
-the whole thing.
+---
 
-This guide assumes **no prior setup**. Follow it top to bottom and you'll have a
-working clone. There are two ways to run it — pick one:
+## Building blocks
 
-- **[Option A — Deploy to Render](#option-a--deploy-to-render-recommended)** (recommended): no code, no local install. ~15 min.
-- **[Option B — Run locally](#option-b--run-locally-for-developers)** (for developers): Python on your machine.
+One small Python service runs two processes against a shared SQLite database:
+
+| Piece | Role |
+|---|---|
+| **gradbot** | The voice pipeline: speech-to-text → LLM → text-to-speech. The clone's "voice + brain." |
+| **Gradium** | Voice cloning, STT, and TTS — what makes the clone sound like you. |
+| **LLM** | Any OpenAI-compatible endpoint (OpenAI, Groq, a local model, …) — generates replies. |
+| **Twilio** | Phone calls in and out. A voice webhook points at your app. |
+| **Telegram bot** | Your chat interface — onboarding, text/voice chat, and commands. |
+| **bridge** | FastAPI service handling Twilio calls + the internal API (port 8082). |
+
+**On Telegram:** `bot → Gradium STT → LLM → Gradium TTS → reply`, with facts
+saved to a local database.
+
+**On a phone call**, the same caller-ID branch decides everything — you reach your
+assistant (your voice, memory, all tools); a stranger reaches a receptionist that
+can only take a message:
+
+![How a call flows through gradphone](docs/clone-call-flow.png)
+
+Optional add-ons: Web search API, **Gmail** (email summary), **Google
+Places** (look up a business to call). See [ARCHITECTURE.md](ARCHITECTURE.md) for
+the deeper design.
 
 ---
 
 ## What your clone can do
 
-| Capability | How you use it | Status |
-|---|---|---|
-| **Clone your voice** | Send a 15–20s voice note on Telegram | ✅ |
-| **Text chat** | Type to the bot — it replies in text | ✅ |
-| **Voice-note chat** | Send a voice note — it replies in *your* cloned voice | ✅ |
-| **Real-time translation** (`/translate`) | Send a voice note — hear it translated, in *your* cloned voice | ✅ |
-| **Remembers you** | Tell it facts ("I'm vegetarian"); it recalls them later | ✅ |
-| **Calls you** (`/callme`) | It phones you and talks in your voice | ✅ |
-| **Answers your number** | You call in → your assistant; a stranger calls → AI receptionist takes a message | ✅ |
-| **Web search** (on calls) | "Search the web for…" — live, sourced answers | ✅ (needs a Linkup key) |
-| **Email summary** (on calls) | "Summarize my recent emails" | ✅ (needs a Gmail app password) |
-| **Natural turn-taking** | Interrupt the clone mid-sentence (barge-in) | ✅ |
-
-> Note: web search and email summary currently work **on phone calls**, not in the
-> Telegram chat.
+| Capability | How you use it |
+|---|---|
+| Clone your voice | Send a 15–30s voice note on Telegram |
+| Text chat | Type to the bot — it replies in text |
+| Voice-note chat | Send a voice note — it replies in *your* voice |
+| Translate | `/translate`, pick a language, send a voice note — hear it back in your voice |
+| Remembers you | Tell it facts ("I'm vegetarian"); it recalls them later |
+| Calls you (`/callme`) | It phones you and talks in your voice |
+| Answers your number | You → your assistant; a stranger → AI receptionist |
+| Web search / email (on calls) | "Search the web for…", "summarize my emails" — needs optional keys |
 
 ---
 
-## Before you start: accounts & keys you'll need
+## Prerequisites
 
-You'll collect a handful of values and paste them into the app's configuration.
-Here's **each one, why it's needed, and exactly how to get it.** Get these first.
+- **macOS or Linux** (Windows: use WSL2). **git** installed.
+- A **phone that can receive an SMS** (once, to verify Twilio).
+- LLM Key
+- Telegram account
 
-### 1. Telegram bot token — **required**
-This is your clone's chat interface.
-1. In Telegram, open a chat with **@BotFather**.
-2. Send `/newbot`, pick a name and a username (must end in `bot`).
-3. BotFather replies with a **token** like `8943069891:AAГ…`. Copy it.
-- → `TELEGRAM_BOT_TOKEN`
-
-### 2. Gradium API key — **required**
-Powers voice cloning, speech-to-text, and text-to-speech.
-- Get a key from your Gradium account (provided to you at the workshop, or from
-  the Gradium dashboard). It looks like `gsk_…`.
-- → `GRADIUM_API_KEY`
-
-### 3. LLM endpoint — **required**
-The "brain" that generates replies. It must be an **OpenAI-compatible** endpoint.
-- **Easiest:** use the Gradium-hosted LLM values provided to you — a base URL and
-  a model name. This endpoint needs **no separate key**.
-  - → `LLM_BASE_URL` (e.g. `https://…/v1`) and `LLM_MODEL` (e.g. `google/gemma-…`)
-- **Or your own:** use OpenAI by setting `OPENAI_API_KEY` (then leave `LLM_BASE_URL`
-  blank), or any other OpenAI-compatible host (Groq, Together, etc.).
-
-### 4. Twilio — **required for phone calls**
-Phone calls in and out. (You can chat on Telegram without this, but `/callme` and
-inbound calls need it.)
-1. Create an account at **twilio.com** and **upgrade it to a paid account** (the
-   free trial adds a "press a key" preamble and only dials verified numbers).
-2. From the Twilio **Console dashboard**, copy:
-   - **Account SID** (starts with `AC…`) → `TWILIO_ACCOUNT_SID`
-   - **Auth Token** (click to reveal) → `TWILIO_AUTH_TOKEN`
-3. **Buy a phone number** (Console → Phone Numbers → Buy a number) with **Voice**
-   capability. It looks like `+1XXXXXXXXXX`. → `TWILIO_PHONE_NUMBER`
-   - This is **voice only** — no SMS — so no A2P/10DLC registration is required.
-- You'll point this number's **Voice webhook** at your app later (a step below).
-
-### 5. Bridge API key — **required**
-A password that protects the app's internal API. **Make one up** — any long random
-string (e.g. run `openssl rand -hex 24`).
-- → `BRIDGE_API_KEY`
-
-### 6. Linkup key — *optional* (enables web search on calls and Telegram text chat)
-1. Sign up at **app.linkup.so** and copy your API key.
-- → `LINKUP_API_KEY` (leave blank to disable web search)
-
-### 7. Gmail app password — *optional* (enables email summary on calls)
-This is **not** your normal Gmail password.
-1. Turn on **2-Step Verification** on the Google account (myaccount.google.com/security).
-2. Go to **myaccount.google.com/apppasswords**, create one named "gradphone".
-3. Google shows a **16-character** password — copy it (spaces don't matter).
-- → `GMAIL_ADDRESS` (your address) and `GMAIL_APP_PASSWORD` (the 16-char password)
+Python 3.12, ffmpeg, and cloudflared are installed for you by `scripts/setup.sh`.
 
 ---
 
-## Option A — Deploy to Render (recommended)
+## Setup
 
-No local install. You get a stable public URL automatically, which Twilio needs.
+### 1. Fork, clone, and run setup
 
-> **Use a paid (Starter) instance.** The free tier sleeps after inactivity and
-> would drop calls. ~$7/month.
+Fork [gradium-ai/digigrad](https://github.com/gradium-ai/digigrad) to your
+account, then:
 
-### Step 1 — Get the code into your own repo
-- **Fork** this repository to your own GitHub account (GitHub → Fork), or push a
-  copy to a repo you control. Render deploys from a GitHub repo you own.
+```bash
+git clone https://github.com/<your-github-username>/digigrad && cd digigrad
+scripts/setup.sh
+```
 
-### Step 2 — Create the service from the Blueprint
-1. Create an account at **render.com** and connect your GitHub.
-2. Click **New → Blueprint**, and select your forked repo.
-3. Render reads the included **`render.yaml`** and sets up one always-on web
-   service with a small disk. It will **prompt you for the secret values** — paste
-   the keys you collected above:
-   - `TELEGRAM_BOT_TOKEN`, `GRADIUM_API_KEY`, `GRADIUM_BASE_URL` (if provided),
-     `LLM_BASE_URL`, `LLM_MODEL`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`,
-     `TWILIO_PHONE_NUMBER`, `BRIDGE_API_KEY`
-   - Set `ALLOW_ARBITRARY_OUTBOUND` to `true` (so it can call *your* number), or
-     instead set `OUTBOUND_ALLOWLIST` to your phone number in `+E.164` form.
-   - Optional: `LINKUP_API_KEY`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`.
-4. Click **Apply**. Render builds the Docker image and deploys (~2 min).
-   - The non-secret settings (always-on, disk, `ENABLE_INBOUND=true`, the voice
-     tuning, and `TWILIO_MACHINE_DETECTION=Disable`) come from `render.yaml`
-     automatically — you don't type those.
+This creates `.venv`, installs the app, and scaffolds `.env` with a
+`BRIDGE_API_KEY` already generated and local-dev defaults set. Now you just
+create the keys below and paste them in.
 
-### Step 3 — Note your public URL
-When the deploy is live, your service has a URL like
-`https://<your-service>.onrender.com`. The app fills in `PUBLIC_HTTP_URL` /
-`PUBLIC_WS_URL` from it automatically — you don't set those.
+### 2. Create your keys
 
-Check it's up: open `https://<your-service>.onrender.com/healthz` — you should see
-`{"status":"ok","gradbot_installed":true,…}`.
+You'll sign up for four services. Here's each key and how to get it.
 
-### Step 4 — Point your Twilio number at the app
-In the Twilio Console → **Phone Numbers → your number → Voice configuration**:
-- Set **"A call comes in"** to **Webhook**, URL:
-  `https://<your-service>.onrender.com/twilio/voice`, method **HTTP POST**. Save.
+**Gradium** — voice cloning, STT, TTS · *required*
 
-Now jump to **[First run](#first-run--set-up-and-use-your-clone)**.
+📹 **[Watch: getting your Gradium API key](docs/videos/gradium-api-key.mp4)**
+
+1. Sign in at **gradium.ai** and open the dashboard.
+2. Create an **API key** (`gsk_…`) → `GRADIUM_API_KEY`.
+3. Pick any **voice UID** in your account (a built-in is fine) → `AGENT_VOICE_ID`.
+   This is the default voice before *your* clone exists; the app won't start
+   without it. Your personal clone is created later in Telegram and overrides it.
+
+**LLM provider** — the "brain" · *required*
+
+Any OpenAI-compatible endpoint; OpenAI is simplest. Create a key at
+**platform.openai.com**, add a small balance, then set **all three**:
+
+```
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-...
+```
+
+Another host (Groq, Together, local LM Studio, …)? Point `LLM_BASE_URL` at its
+`/v1` endpoint, set `LLM_MODEL`, and put its key in `OPENAI_API_KEY`.
+
+**Telegram** — your clone's chat interface · *required*
+
+1. Message **@BotFather**, send `/newbot`, pick a name and a username ending in
+   `bot`. Copy the token (`8943…:AAH…`) → `TELEGRAM_BOT_TOKEN`.
+2. Message **@userinfobot** to get your numeric **Id** → `ALLOWED_TELEGRAM_IDS`.
+   The bot fails closed — without this it ignores everyone, including you.
+
+**Twilio** — phone calls · *required for calls*
+
+📹 **[Watch: getting your Twilio number](docs/videos/twilio-number.mp4)**
+
+A free trial is enough for `/callme` to your own phone.
+
+1. Sign up at **twilio.com** and verify your account (SMS code).
+2. **Verify your own phone number** as a Caller ID — on the trial this is the only
+   number your clone may call.
+3. From the **Console dashboard** copy: **Account SID** (`AC…`) →
+   `TWILIO_ACCOUNT_SID`, **Auth Token** → `TWILIO_AUTH_TOKEN`.
+4. Get your **trial phone number** (Console → Phone Numbers) → `TWILIO_PHONE_NUMBER`.
+
+> **Trial limits:** calls play a short "press any key" preamble and can only dial
+> numbers you've verified — fine for `/callme`. To call any number with no
+> preamble, **upgrade to paid** (add a card). Nothing else changes.
+
+**Optional add-ons** (leave blank to skip): `LINKUP_API_KEY` (web search, from
+app.linkup.so), `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` (email summary, a 16-char
+app password from myaccount.google.com/apppasswords), `GOOGLE_PLACES_API_KEY`
+(look up a business to call).
+
+### 3. Paste the keys into `.env`
+
+Open `.env` and fill in what you created. Everything else (`BRIDGE_API_KEY`,
+`TWILIO_MACHINE_DETECTION=Disable`, `ENABLE_INBOUND=true`,
+`ALLOW_ARBITRARY_OUTBOUND=true`) is already set by `setup.sh` — don't touch it.
+
+```bash
+GRADIUM_API_KEY=gsk_...
+AGENT_VOICE_ID=...
+
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+OPENAI_API_KEY=sk-...
+
+TELEGRAM_BOT_TOKEN=...
+ALLOWED_TELEGRAM_IDS=<your-telegram-id>
+
+TWILIO_ACCOUNT_SID=AC...
+TWILIO_AUTH_TOKEN=...
+TWILIO_PHONE_NUMBER=+1XXXXXXXXXX
+```
+
+The full annotated list is in [`.env.example`](.env.example).
+
+### 4. Run it
+
+```bash
+scripts/run_local.sh
+```
+
+This opens a public tunnel, writes its URL into `.env`, points your Twilio
+number's voice webhook at it, and starts both processes. **Leave it running**;
+Ctrl-C stops everything. Re-run any time — it re-syncs the tunnel + webhook (quick
+tunnels rotate their URL on restart).
+
+Check it's alive in another terminal:
+
+```bash
+curl http://localhost:8082/healthz
+# {"status":"ok","gradbot_installed":true,...}
+```
+
+> **Deploying instead of running locally?** Render gives you a stable public URL
+> with no local install via the included `render.yaml` — see
+> [RENDER.md](RENDER.md) and [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ---
 
-## Option B — Run locally (for developers)
+## First use, in Telegram
 
-You need your own machine reachable by Twilio, which means a tunnel.
+1. Open your bot, send `/start`, then `/register`.
+2. Tap **Share my number** so your clone recognizes you on calls.
+3. Send a clean **15–30s voice note** → tap **✅ Yes, clone my voice**.
+4. Try it:
+   - **Text** anything → it replies as your clone.
+   - **Send a voice note** → it replies in *your* voice.
+   - **"translate this to Spanish"** then a voice note → translated, in your voice.
+   - **`/callme`** → your clone phones you. Try interrupting it mid-sentence, or
+     "what do you remember about me?".
 
-### Prerequisites
-- **Python 3.12 exactly** (not 3.11, not 3.13). Check: `python3.12 --version`.
-- **ffmpeg** installed (used to process voice notes). macOS: `brew install ffmpeg`.
-- A tunnel tool: **cloudflared** (`brew install cloudflared`) or ngrok.
+### Commands
 
-### Step 1 — Install
-```bash
-git clone <your-repo-url> && cd gradphone-aie
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e .
-```
-
-### Step 2 — Configure
-```bash
-cp .env.example .env
-```
-Open `.env` and fill in the keys you collected (see the
-[reference table](#environment-variables-reference) below). At minimum:
-`TELEGRAM_BOT_TOKEN`, `GRADIUM_API_KEY`, `LLM_BASE_URL` + `LLM_MODEL` (or
-`OPENAI_API_KEY`), the three `TWILIO_*` values, `BRIDGE_API_KEY`. Also set
-`ENABLE_INBOUND=true`, `ALLOW_ARBITRARY_OUTBOUND=true`, and
-`TWILIO_MACHINE_DETECTION=Disable`.
-
-### Step 3 — Start a tunnel and set the public URL
-```bash
-cloudflared tunnel --url http://localhost:8082
-```
-It prints a URL like `https://something.trycloudflare.com`. In `.env` set:
-```
-PUBLIC_HTTP_URL=https://something.trycloudflare.com
-PUBLIC_WS_URL=wss://something.trycloudflare.com
-```
-> Quick tunnels get a **new URL every restart** — update both lines (and the
-> Twilio webhook in Step 5) whenever it changes.
-
-### Step 4 — Run the two processes (two terminals)
-```bash
-# Terminal 1 — the bridge (phone calls + web API)
-uvicorn gradphone.bridge:app --host 0.0.0.0 --port 8082
-
-# Terminal 2 — the Telegram bot
-python -m gradphone.bot
-```
-Check: `curl http://localhost:8082/healthz`
-
-### Step 5 — Point your Twilio number at the tunnel
-Twilio Console → your number → Voice webhook (HTTP POST):
-`https://something.trycloudflare.com/twilio/voice`.
-
----
-
-## First run — set up and use your clone
-
-Do this in Telegram with **the bot you created** (search its username).
-
-1. **Register:** send `/register`.
-   - If the operator set a workshop code, send `/register <code>`.
-2. **Clone your voice:** send a **15–20 second voice note** of you talking. Tap
-   **"✅ Yes, clone my voice"** when asked to confirm it's your own voice. Wait for
-   the "voice ready" confirmation.
-3. **Share your phone number:** use Telegram's **share-contact** to send the bot
-   your own contact. This links your caller ID so that when *you* call in, you
-   reach **your assistant** (not the receptionist).
-4. **Try it:**
-   - **Text:** just type a message — the clone replies in text.
-   - **Voice note:** send one — the clone replies in *your* voice.
-   - **Translate:** send `/translate`, pick a language, then send a voice note —
-     hear yourself speak it in that language, in your own cloned voice.
-   - **Call you:** send `/callme +<your-number>` — your phone rings and your clone
-     talks to you. Try interrupting it mid-sentence; try "what do you remember
-     about me?"; on a call, "search the web for today's weather in Paris" or
-     "summarize my recent emails".
-   - **Call in:** dial your Twilio number from your phone → you reach your
-     assistant. From any other phone → the AI receptionist takes a message.
-
-### Other Telegram commands
 | Command | What it does |
 |---|---|
 | `/register [code]` | Become a tenant (clone owner). |
 | `/callme <+number>` | Your clone calls that number and converses. |
-| `/translate` | Pick a language, then send a voice note — get it back translated in your cloned voice. |
-| `/voice` | Show your current cloned voice. |
-| `/clear_voice` | Delete your clone so you can re-record. |
-| `/history` | Your recent calls. |
-| `/status` | Calls currently in progress. |
+| `/translate` | Pick a language, send a voice note, get it back in your voice. |
+| `/voice` · `/clear_voice` | Show / delete your cloned voice. |
+| `/history` · `/status` | Recent calls / calls in progress. |
 | `/whoami` | Your Telegram ID + registration status. |
-
----
-
-## Environment variables reference
-
-Set these in Render's dashboard (Option A) or in `.env` (Option B).
-
-### Required
-| Variable | What it is |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Your bot token from @BotFather. |
-| `GRADIUM_API_KEY` | Gradium key (voice clone, STT, TTS). |
-| `LLM_BASE_URL` + `LLM_MODEL` | OpenAI-compatible LLM endpoint + model. (Or use `OPENAI_API_KEY`.) |
-| `TWILIO_ACCOUNT_SID` | From the Twilio console (`AC…`). |
-| `TWILIO_AUTH_TOKEN` | From the Twilio console. |
-| `TWILIO_PHONE_NUMBER` | Your bought Twilio number (`+E.164`). |
-| `BRIDGE_API_KEY` | Any long random string you choose. |
-| `PUBLIC_HTTP_URL` / `PUBLIC_WS_URL` | Public URLs Twilio reaches you at. **Auto-set on Render**; set manually for local. |
-
-### Recommended / common
-| Variable | Default | Notes |
-|---|---|---|
-| `ENABLE_INBOUND` | `false` | Set `true` so the number answers incoming calls. |
-| `ALLOW_ARBITRARY_OUTBOUND` | `false` | Set `true` to let it dial any number (or use `OUTBOUND_ALLOWLIST`). |
-| `OUTBOUND_ALLOWLIST` | — | Comma-separated `+E.164` numbers it's allowed to dial. |
-| `TWILIO_MACHINE_DETECTION` | `Enable` | **Set `Disable`** for `/callme`/inbound (a human answers; AMD otherwise misfires to voicemail). |
-| `WORKSHOP_CODE` | — | If set, `/register` requires this code. |
-| `GRADBOT_MAX_CONCURRENT` | `3` | Max simultaneous calls (Gradium caps this per account). |
-| `MAX_CALL_DURATION_SECONDS` | `600` | Hard hang-up after this many seconds. |
-
-### Optional features
-| Variable | Enables |
-|---|---|
-| `LINKUP_API_KEY` | Web search on calls and in Telegram text chat. |
-| `GMAIL_ADDRESS` + `GMAIL_APP_PASSWORD` | Email summary on calls. |
-| `GRADIUM_URL` (default `https://satellite-scw.gradium.ai/api`) | Host for the `/translate` speech-to-speech engine (separate from `GRADIUM_BASE_URL`). |
-| `GRADIUM_TRANSLATE_VOICE_ID` | Force a specific voice for translated output; required only to translate into a language with no built-in voice (built-ins: en, fr, es, de, pt). |
-| `BARGE_IN_GUARD_S` (default `1.0`) | Seconds at the start of each clone turn where interruptions are ignored (raise if barge-in feels too twitchy). |
-| `GRADBOT_SILENCE_TIMEOUT_S` (default `2.0`) | How long a pause ends the caller's turn (lower = snappier). |
-
-The full annotated list is in **`.env.example`**.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Cause & fix |
+| Symptom | Fix |
 |---|---|
-| **`/callme` connects then ends in a few seconds (silence)** | Twilio Answering Machine Detection misread your "hello" as voicemail. Set `TWILIO_MACHINE_DETECTION=Disable`. |
-| **Call answers but you hear nothing / it drops** | The media-stream WebSocket isn't connecting. Make sure `PUBLIC_WS_URL` is the exact public host as `wss://…` (on Render it's auto-set; locally it must match your live tunnel and the Twilio webhook). |
-| **Twilio webhook returns 403** | `PUBLIC_HTTP_URL` doesn't match the URL Twilio actually called. Re-point the Twilio webhook and update `PUBLIC_HTTP_URL`. |
-| **Bot logs `telegram.error.Conflict … only one bot instance`** | The same `TELEGRAM_BOT_TOKEN` is running in two places. Stop the other one — one bot process per token. |
-| **You call in but get the receptionist, not your assistant** | Your caller ID isn't linked. Share your contact with the bot (First-run step 3). |
-| **"Couldn't hear that" on a voice note** | `ffmpeg` missing (local) — install it. On Render it's already in the image. |
-| **Calls stop connecting on a free Render instance** | Free instances sleep. Use the paid Starter plan (always-on). |
-| **Web search / email "didn't work" in Telegram chat** | Those tools run on **phone calls**, not Telegram chat. Use `/callme` and ask there. |
-
-To see what's happening, check your logs: in Render, open the service's **Logs**
-tab; locally, watch the two terminal windows.
+| `curl /healthz` fails | `run_local.sh` must still be running; check `/tmp/gradphone_bridge.log`. |
+| Bot says nothing / `409 Conflict` | Two bots share one token — run only **one** `run_local.sh`; kill stray `gradphone.bot` processes. |
+| "Missing required environment variable …" | That key is blank in `.env` — fill it and re-run. |
+| `LLM_BASE_URL / LLM_MODEL not set` | You set only `OPENAI_API_KEY` — set all three (Setup §2). |
+| Voice notes fail | ffmpeg isn't installed — re-run `scripts/setup.sh`. |
+| Call connects then drops in seconds | Twilio AMD misread "hello" as voicemail — keep `TWILIO_MACHINE_DETECTION=Disable`. |
+| You call in but get the receptionist | Your caller ID isn't linked — share your contact (First use §2). |
+| "press any key" on a call | The Twilio trial preamble — upgrade to paid to remove it. |
 
 ---
 
-## Known limits
+## Voice agent concepts
 
-- **One owner per deployment.** Each running instance is a single person's clone.
-  (For many people, each person deploys their own.)
-- **Languages:** English, French, Portuguese.
-- **Web search & email** are available on calls, not in Telegram chat (yet).
-- **Concurrency** is capped by your Gradium account (default 3 simultaneous calls).
-- **Fillers** (a sound while the clone "thinks") are experimental and off by
-  default (`ENABLE_FILLERS=0`).
+Gradbot handles most of this for you, but these are the terms worth knowing.
+
+<details>
+<summary>Glossary</summary>
+
+- **Cascaded pipeline** — speech-to-text → model → text-to-speech, chained. Every
+  stage is inspectable and swappable. This is what gradphone uses.
+- **Speech-to-speech (end-to-end)** — one model takes audio in, gives audio out. The other   main approach.
+- **Half duplex** — one side talks at a time (walkie-talkie). Phone lines are half
+  duplex by nature.
+- **Full duplex** — both sides can talk at once, like a real conversation. The feel
+  we want, even over a half-duplex line.
+- **VAD (voice activity detection)** — telling when someone is speaking vs silent.
+- **Endpointing / turn detection** — deciding when the caller finished their turn.
+  Too eager cuts them off; too slow feels laggy.
+- **Barge-in** — letting the caller interrupt while the agent is talking; the agent
+  stops and listens. This is what makes a half-duplex line feel full duplex.
+- **Fillers** — a short "let me see" so the line isn't dead while the model thinks.
+- **Time to first audio** — how long from the end of your turn to the first sound
+  back. This is what people feel as fast or slow, so on a live call we stream
+  everything; off the call (voice notes, translation) we optimize for quality.
+- **Wire format** — phone audio is 8 kHz μ-law (G.711). Mismatched sample rates are
+  usually why audio sounds too fast or too slow.
+
+</details>
 
 ---
 
-## How it works (brief)
+## Cleanup
 
-```
-Telegram  ──voice/text──►  bot  ──►  Gradium STT → LLM → Gradium TTS  ──►  reply
-                                  └─ remembers facts in a local database
+When you're done: stop the processes (Ctrl-C in the `run_local.sh` terminal),
+delete your clone and recordings (`/clear_voice` in Telegram), and rotate any keys
+that were handed to you.
 
-Phone     ──►  Twilio  ──►  bridge (/twilio/voice)  ──►  Media Stream (WebSocket)
-                                                      ──►  gradbot session
-              you (owner)  → your assistant (your voice + memory + tools)
-              anyone else  → AI receptionist (takes a message)
-```
-
-A single service runs both the **bridge** (phone calls + API) and the **bot**
-(Telegram). Data (your profile, voice id, memory, call history) lives in a small
-SQLite database on disk (or Postgres for larger hosted setups).
