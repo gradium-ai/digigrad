@@ -26,6 +26,7 @@ import aiohttp
 
 from . import audio_io
 from . import memory as memory_mod
+from . import places
 from . import websearch
 from .business_agent import language_name
 
@@ -34,8 +35,9 @@ log = logging.getLogger(__name__)
 _STT_SAMPLE_RATE = 24000  # Gradium STT operates at 24 kHz
 _MAX_HISTORY_TURNS = 12  # rolling user+assistant messages kept for context
 _LLM_TIMEOUT = 30
-_MAX_TOOL_ROUNDS = 3  # cap web_search → LLM round-trips per reply
+_MAX_TOOL_ROUNDS = 3  # cap tool → LLM round-trips per reply
 _WEB_SEARCH_TIMEOUT = 10.0  # seconds for one Linkup call
+_FIND_BUSINESS_TIMEOUT = 8.0  # seconds for one Google Places call
 
 
 def _gradium_client():
@@ -82,6 +84,7 @@ def _system_prompt(
     language: str = "en",
     channel: str = "voice",
     web_search_enabled: bool = False,
+    places_enabled: bool = False,
 ) -> str:
     lang = language_name(language)
     block = (
@@ -89,20 +92,13 @@ def _system_prompt(
         "don't recite):\n" + memory_digest + "\n"
         if memory_digest.strip() else ""
     )
-    if channel == "text":
+    is_text = channel == "text"
+    if is_text:
         medium = "casual text chat"
         style = (
             "You're texting, so reply in clear written text. You MAY use short lists "
             "and include specifics like names and addresses when they're what's asked for."
         )
-        if web_search_enabled:
-            style += (
-                " You can look things up on the live web with the web_search tool. "
-                "Use it whenever they ask about current facts that may be outside your "
-                "training knowledge — today's news, weather, recent events, prices, "
-                "scores, anything time-sensitive — instead of guessing. After searching, "
-                "answer in your own words and add the source links on their own lines."
-            )
     else:
         medium = "casual voice chat"
         style = (
@@ -110,10 +106,47 @@ def _system_prompt(
             "quick voice message. This will be read aloud by text-to-speech, so never "
             "use markdown, bullet points, emoji, or stage directions."
         )
+    # Tool guidance — applies to BOTH channels. For voice, keep answers brief and
+    # link-free since they're spoken; for text, links and lists are fine.
+    if web_search_enabled:
+        style += (
+            " You can look things up on the live web with the web_search tool. Use it "
+            "whenever they ask about current facts that may be outside your training "
+            "knowledge — today's news, weather, recent events, prices, scores, anything "
+            "time-sensitive — instead of guessing."
+        )
+        style += (
+            " After searching, answer in your own words and add the source links on "
+            "their own lines." if is_text
+            else " After searching, give the answer briefly in your own words — do NOT "
+            "read out URLs or source links."
+        )
+    if places_enabled:
+        style += (
+            " To find places or businesses nearby — restaurants, cafes, shops — or look "
+            "up a place's details or phone number, use the find_business tool (NOT "
+            "web_search). Finding and listing options is a valid request on its own."
+        )
+        style += (
+            " List the top few with their rating and address." if is_text
+            else " Read back the top two or three by name and rating, briefly."
+        )
     return (
         f"You are {name}'s personal assistant, speaking as their voice clone in a "
         f"{medium}. {style}\n"
         f"{block}"
+        "\nMEMORY: When they tell you something durable about themselves — a "
+        "preference, dietary restriction, allergy, name, relationship, plan, or "
+        "recurring need — call the remember tool with one concise fact, AND confirm "
+        "briefly that you've saved it. If they ask you to remember something, you MUST "
+        "call remember; saying 'I'll keep that in mind' without calling it does NOT "
+        "save it. If you're unsure what you already know, call recall.\n"
+        "\nAPPLY WHAT YOU KNOW: Before recommending food, drinks, places, or products, "
+        "check what you know about them and use it. If a recommendation conflicts with a "
+        "known restriction or allergy (e.g. they're lactose intolerant and you're "
+        "suggesting ice cream), say so and steer them to a suitable option — e.g. flag "
+        "dairy-free choices. Acting on a known constraint is being helpful, not "
+        "'reciting' — do it proactively.\n"
         "\nIMPORTANT — answer the request directly in THIS reply. You have no way to "
         "send anything separately, 'put together' a list later, or follow up in another "
         "message; there is no background task. If they ask for a list or details, give "
@@ -179,6 +212,142 @@ async def _run_web_search(query: str) -> dict:
         return {"error": "The search failed — say you couldn't look it up right now."}
 
 
+def find_business_available() -> bool:
+    """True when Google Places is configured, so the assistant can find places."""
+    return places.available()
+
+
+def _find_business_tool_schema() -> dict:
+    """OpenAI-style function schema for the find_business (Google Places) tool."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "find_business",
+            "description": (
+                "Find real businesses or places nearby and their details — name, "
+                "rating, address, and phone number — via Google Places. Use this for "
+                "ANY 'find / recommend / what's a good X near Y' request, e.g. 'find "
+                "good Indian restaurants nearby' or 'a coffee shop near my hotel'. "
+                "Returns a ranked list, best first. Use this (NOT web_search) to find "
+                "places and their phone numbers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "What to find, with the area/landmark — e.g. 'highly "
+                            "rated Indian restaurant near Clancy Hotel, San Francisco'."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+
+async def _run_find_business(query: str) -> dict:
+    """Execute one find_business tool call; never raises — returns a dict the LLM
+    can read, with an `error` key when the lookup couldn't run."""
+    query = (query or "").strip()
+    if not query:
+        return {"error": "Empty query — ask what place to find."}
+    try:
+        results = await asyncio.wait_for(
+            asyncio.to_thread(places.find_businesses, query),
+            timeout=_FIND_BUSINESS_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        log.warning("chat: find_business timed out for %r", query[:120])
+        return {"error": "The lookup took too long — say you couldn't pull it up."}
+    except places.PlacesNotConfigured:
+        return {"error": "Place lookup isn't set up."}
+    except places.PlacesError as exc:
+        log.warning("chat: find_business failed: %s", exc)
+        return {"error": "The lookup failed — say you couldn't find it right now."}
+    return {"results": results}
+
+
+def _remember_tool_schema() -> dict:
+    """OpenAI-style schema for the remember tool — same store the call uses."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Save ONE durable fact about the user for future chats and calls — a "
+                "preference, dietary restriction, name, relationship, plan, or recurring "
+                "need. Call this whenever the user tells you something worth keeping or "
+                "explicitly asks you to remember it (e.g. 'I'm lactose intolerant', "
+                "'remember my wife's name is Mei'). One concise fact per call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {
+                        "type": "string",
+                        "description": "One short, self-contained fact, e.g. 'The user is lactose intolerant.'",
+                    },
+                },
+                "required": ["fact"],
+            },
+        },
+    }
+
+
+def _recall_tool_schema() -> dict:
+    """OpenAI-style schema for the recall tool — searches saved memory."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": (
+                "Look up what you already know about the user from past chats and calls. "
+                "Call this when they refer to something from before, ask what you know, "
+                "or when a known preference/constraint (diet, allergy, budget, location) "
+                "could affect your answer — e.g. before recommending food or places."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "Optional topic to filter on (e.g. 'diet'). Omit to get recent facts.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+
+
+async def _run_remember(tenant_id: int, fact: str, room: str) -> dict:
+    """Persist one fact; never raises. Same memory store as the call path."""
+    fact = (fact or "").strip()
+    if not fact:
+        return {"error": "Empty fact — nothing to remember."}
+    try:
+        saved = await memory_mod.add_memory(
+            tenant_id, fact, source="remember_tool", room=room
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("chat: remember failed: %s", exc)
+        return {"error": "Couldn't save that right now."}
+    return {"saved": saved, "fact": fact}
+
+
+async def _run_recall(tenant_id: int, topic: str) -> dict:
+    """Search saved memory; never raises."""
+    try:
+        facts = await memory_mod.search_memories(tenant_id, topic or "")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("chat: recall failed: %s", exc)
+        return {"facts": []}
+    return {"facts": facts}
+
+
 async def _chat(messages: list[dict], tools: list[dict] | None = None,
                 max_tokens: int = 300) -> dict:
     """One LLM completion against the configured OpenAI-compatible endpoint.
@@ -220,11 +389,13 @@ async def _chat(messages: list[dict], tools: list[dict] | None = None,
 
 
 async def _complete_with_tools(messages: list[dict], tools: list[dict] | None,
-                               max_tokens: int) -> str:
-    """Run the LLM, servicing any web_search tool calls, until it returns prose.
+                               max_tokens: int, tenant_id: int = 0,
+                               room: str = "") -> str:
+    """Run the LLM, servicing tool calls, until it returns prose.
 
     ``messages`` is mutated in place with the assistant + tool turns. Without
-    tools this is a single completion.
+    tools this is a single completion. ``tenant_id``/``room`` scope the
+    remember/recall tools to the same memory store the call path uses.
     """
     msg: dict = {}
     for _ in range(_MAX_TOOL_ROUNDS if tools else 1):
@@ -241,6 +412,12 @@ async def _complete_with_tools(messages: list[dict], tools: list[dict] | None,
                 args = {}
             if fn.get("name") == "web_search":
                 result = await _run_web_search(args.get("query", ""))
+            elif fn.get("name") == "find_business":
+                result = await _run_find_business(args.get("query", ""))
+            elif fn.get("name") == "remember":
+                result = await _run_remember(tenant_id, args.get("fact", ""), room)
+            elif fn.get("name") == "recall":
+                result = await _run_recall(tenant_id, args.get("topic", ""))
             else:
                 result = {"error": f"Unknown tool {fn.get('name')!r}."}
             messages.append({
@@ -269,18 +446,29 @@ async def reply(
     """
     tenant_id = int(tenant["id"])
     digest = await memory_mod.render_digest(tenant_id)
-    # Web search is text-only: spoken replies are synthesized by TTS, where
-    # source links and longer answers don't belong.
-    use_web = channel == "text" and web_search_available()
+    # Tools work on BOTH channels (typed text and voice notes). For voice the
+    # system prompt steers answers to be brief and link-free, since they're
+    # read aloud by TTS.
+    use_web = web_search_available()
+    use_places = find_business_available()
     system = _system_prompt(
         tenant.get("name") or "the user", digest,
-        channel=channel, web_search_enabled=use_web,
+        channel=channel, web_search_enabled=use_web, places_enabled=use_places,
     )
     messages = [{"role": "system", "content": system}, *history,
                 {"role": "user", "content": user_text}]
-    tools = [_web_search_tool_schema()] if use_web else None
+    # remember/recall are always available — same memory store the call path
+    # uses — so "remember X" saves identically whether typed, sent as a voice
+    # note, or said on a call. Channel only changes phrasing, never capability.
+    tools: list[dict] = [_remember_tool_schema(), _recall_tool_schema()]
+    if use_web:
+        tools.append(_web_search_tool_schema())
+    if use_places:
+        tools.append(_find_business_tool_schema())
+    room = "telegram-text" if channel == "text" else "telegram-voice"
     answer = await _complete_with_tools(
         messages, tools, max_tokens=500 if channel == "text" else 300,
+        tenant_id=tenant_id, room=room,
     )
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": answer})

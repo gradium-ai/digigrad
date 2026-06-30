@@ -336,8 +336,13 @@ def build_assistant_prompt(spec: BusinessCallSpec, memory_digest: str = "") -> s
     """
     lang = language_name(spec.language)
     memory_block = (
-        "\nWHAT YOU ALREADY KNOW ABOUT THE CALLER (from past calls — use it "
-        "naturally, don't recite it):\n" + memory_digest + "\n"
+        "\nWHAT YOU ALREADY KNOW ABOUT THE CALLER (from past chats and calls — use it "
+        "naturally, don't recite the whole list):\n" + memory_digest + "\n"
+        "APPLY IT: before recommending food, drinks, places, or products, check these "
+        "facts and use them. If a suggestion conflicts with a known restriction or "
+        "allergy (e.g. they're lactose intolerant and it's ice cream), SAY SO and steer "
+        "them to a suitable option — e.g. flag dairy-free choices. Acting on a known "
+        "constraint is being helpful, not reciting — do it proactively.\n"
         if memory_digest.strip()
         else ""
     )
@@ -377,6 +382,13 @@ def build_assistant_prompt(spec: BusinessCallSpec, memory_digest: str = "") -> s
         "and do NOT give a second or revised version with different numbers. Use ONLY the figures from the "
         "search result; if the result is unclear, say so once rather than inventing a different value. "
         "Giving two different answers to the same question is a failure.\n"
+        "- Find places and give recommendations. When they ask you to 'find', "
+        "'recommend', or 'what's a good X near Y' — restaurants, cafes, shops nearby — "
+        "call find_business (NOT web_search) and read back the top two or three by name "
+        "and rating, briefly. Finding and listing options is a complete, valid request "
+        "ON ITS OWN: you can absolutely look places up, not just call them. Do this even "
+        "when they don't want a call — only place a call if they then ask you to. If you "
+        "don't know where they are, ask once where to search near.\n"
         "- Place phone calls for them. When they ask you to 'call X and …' — call a "
         "cafe to order a matcha latte, call a restaurant to ask about availability, "
         "call a shop to check stock — you MUST actually call the place_call tool. "

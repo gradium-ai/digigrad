@@ -342,14 +342,18 @@ def _find_business_tool_def() -> Any:
     return gradbot.ToolDef(
         name="find_business",
         description=(
-            "Look up a real business and its VERIFIED phone number to call. Use this "
-            "(NOT web_search) whenever the caller wants you to call a place — e.g. "
-            "'find a cafe near my hotel and call the best one'. Returns a ranked list "
-            "of candidates (name, rating, address, phone in E.164), best first. Pick the "
-            "top-rated one that has a phone and pass that phone straight to place_call. "
-            "Do NOT use web_search to find phone numbers — its numbers are unreliable. "
-            "It runs a live lookup and takes a few seconds, so say ONE short filler that "
-            "fits the request first (e.g. 'let me find that for you') — then call it."
+            "Look up real businesses nearby and their details — name, rating, address, "
+            "and VERIFIED phone number (E.164) — via Google Places. Use this (NOT "
+            "web_search) for ANY 'find / recommend / what's a good X near Y' request, "
+            "e.g. 'find good Indian restaurants nearby' or 'find a cafe near my hotel and "
+            "call the best one'. Returns a ranked list of candidates, best first. This "
+            "works for DISCOVERY ON ITS OWN, not only before a call: if the caller just "
+            "wants suggestions, read back the top two or three by name and rating. If "
+            "they want you to call, pick the top-rated one that has a phone and pass it "
+            "straight to place_call. Do NOT use web_search to find places or phone "
+            "numbers — its numbers are unreliable. It runs a live lookup and takes a few "
+            "seconds, so say ONE short filler that fits the request first (e.g. 'let me "
+            "find that for you') — then call it."
         ),
         parameters_json=json.dumps({
             "type": "object",
@@ -1047,31 +1051,46 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
             await handle.send_error("Refused: empty query — say what business to find.")
             return
         log.info("call %s | find_business query=%r", state.room_name, query)
-        t0 = time.time()
-        try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(places.find_businesses, query), timeout=8.0
-            )
-        except asyncio.TimeoutError:
-            log.warning("call %s | find_business TIMEOUT query=%r", state.room_name, query)
-            _timeline_event(state, "find_business", query=query[:120], error="timeout")
-            await handle.send_json({"error": "The lookup took too long — tell the caller you couldn't pull it up."})
-            return
-        except places.PlacesNotConfigured:
-            log.warning("call %s | find_business not configured (GOOGLE_PLACES_API_KEY missing)", state.room_name)
-            _timeline_event(state, "find_business", error="not_configured")
-            await handle.send_json({"error": "Business lookup isn't set up.", "configured": False})
-            return
-        except places.PlacesError as exc:
-            log.warning("call %s | find_business FAILED query=%r: %s", state.room_name, query, exc)
-            _timeline_event(state, "find_business", query=query[:120], error="failed")
-            await handle.send_json({"error": "Couldn't look that up right now."})
-            return
-        n_with_phone = sum(1 for r in results if r.get("phone"))
-        log.info("call %s | find_business OK in %.1fs results=%d with_phone=%d query=%r",
-                 state.room_name, time.time() - t0, len(results), n_with_phone, query)
-        _timeline_event(state, "find_business", query=query[:120], results=len(results), with_phone=n_with_phone)
-        await handle.send_json({"results": results})
+        # Serialize + cache per-call (same as web_search): gemma fires the same
+        # find_business query in a burst, and two Places lookups produce two
+        # answer turns that collide and clip each other's TTS. Collapsing the
+        # burst to one lookup + identical cached payload means the model can't
+        # answer twice with conflicting results. Namespaced key so it can't
+        # collide with web_search's cache entries.
+        key = "place:" + query.lower()
+        async with state.search_lock:
+            cached = state.search_cache.get(key)
+            if cached and (time.monotonic() - cached[0]) < _SEARCH_CACHE_TTL:
+                log.info("call %s | find_business CACHED query=%r", state.room_name, query)
+                await handle.send_json(cached[1])
+                return
+            t0 = time.time()
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(places.find_businesses, query), timeout=8.0
+                )
+            except asyncio.TimeoutError:
+                log.warning("call %s | find_business TIMEOUT query=%r", state.room_name, query)
+                _timeline_event(state, "find_business", query=query[:120], error="timeout")
+                await handle.send_json({"error": "The lookup took too long — tell the caller you couldn't pull it up."})
+                return
+            except places.PlacesNotConfigured:
+                log.warning("call %s | find_business not configured (GOOGLE_PLACES_API_KEY missing)", state.room_name)
+                _timeline_event(state, "find_business", error="not_configured")
+                await handle.send_json({"error": "Business lookup isn't set up.", "configured": False})
+                return
+            except places.PlacesError as exc:
+                log.warning("call %s | find_business FAILED query=%r: %s", state.room_name, query, exc)
+                _timeline_event(state, "find_business", query=query[:120], error="failed")
+                await handle.send_json({"error": "Couldn't look that up right now."})
+                return
+            n_with_phone = sum(1 for r in results if r.get("phone"))
+            log.info("call %s | find_business OK in %.1fs results=%d with_phone=%d query=%r",
+                     state.room_name, time.time() - t0, len(results), n_with_phone, query)
+            _timeline_event(state, "find_business", query=query[:120], results=len(results), with_phone=n_with_phone)
+            payload = {"results": results}
+            state.search_cache[key] = (time.monotonic(), payload)
+            await handle.send_json(payload)
         return
 
     if name == "take_message":
