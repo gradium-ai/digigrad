@@ -1,13 +1,16 @@
 """Business-call prompt helpers.
 
-This mode is intentionally narrow. OpenClaw can dispatch the call, but the
-live phone agent should not inherit Gizmo's broad personal/tool surface.
+This mode is intentionally narrow: the bridge can dispatch the call, but the
+live phone agent should not inherit the assistant's broad personal/tool
+surface.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -138,22 +141,45 @@ def build_opener_text(spec: BusinessCallSpec) -> str:
     return _OPENER_TEXT.get(code, _OPENER_TEXT["en"])
 
 
-PERSONAL_DETAIL_RE = re.compile(
-    r"(?i)"
-    r"(colin@gradium\.ai|"
-    r"gizmograd@gmail\.com|"
-    r"\+?1?415[-.\s]?881[-.\s]?0301|"
-    r"\+33[-.\s]?6[-.\s]?76[-.\s]?89[-.\s]?76[-.\s]?32|"
-    r"credit card|card number|payment|billing address|home address)"
-)
+# Payment/address vocabulary is always guarded; the deployment owner's actual
+# contact details come from env so the guard protects whoever runs this
+# deployment (never hardcode anyone's PII here — the filter itself would leak
+# it, and it would protect nobody else's).
+_GENERIC_DETAIL_TERMS = r"credit card|card number|payment|billing address|home address"
+
+
+def _redaction_literals() -> tuple[str, ...]:
+    """Owner contact details to redact: OPERATOR_EMAIL, OPERATOR_PHONE, plus
+    any comma-separated extras in REDACT_EXTRA."""
+    literals = [
+        os.environ.get("OPERATOR_EMAIL", "").strip(),
+        os.environ.get("OPERATOR_PHONE", "").strip(),
+        *(s.strip() for s in os.environ.get("REDACT_EXTRA", "").split(",")),
+    ]
+    return tuple(lit for lit in literals if lit)
+
+
+@lru_cache(maxsize=8)
+def _personal_detail_re(literals: tuple[str, ...]) -> re.Pattern:
+    parts = []
+    for lit in literals:
+        digits = "".join(ch for ch in lit if ch.isdigit())
+        if "@" not in lit and len(digits) >= 7:
+            # A phone number: match its digits with any spacing/punctuation
+            # (and an optional '+'), the way a model tends to read one out.
+            parts.append(r"\+?" + r"[-.\s()]*".join(digits))
+        else:
+            parts.append(re.escape(lit))
+    parts.append(_GENERIC_DETAIL_TERMS)
+    return re.compile("(?i)(" + "|".join(parts) + ")")
 
 
 def contains_personal_detail(text: str) -> bool:
-    return bool(PERSONAL_DETAIL_RE.search(text or ""))
+    return bool(_personal_detail_re(_redaction_literals()).search(text or ""))
 
 
 def redact_personal_details(text: str) -> str:
-    return PERSONAL_DETAIL_RE.sub("[redacted]", text or "")
+    return _personal_detail_re(_redaction_literals()).sub("[redacted]", text or "")
 
 
 def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool = False) -> str:
@@ -214,7 +240,7 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
               pt="'Entendido, muito obrigado — isso ajuda.'") + " Keep it short and genuine. Do not acknowledge mid-utterance.\n"
         "- If they sound rushed or curt, mirror it: skip the niceties, get to the point, then thank them at the end.\n"
         "- Use simple, friendly language. Avoid jargon, scripts, or robotic phrasing.\n"
-        "- Do not say you are Gizmo, OpenClaw, an assistant app, or a bot unless they ask directly.\n"
+        "- Do not name any app, product, or company you belong to; if they ask directly whether you are a bot, answer honestly.\n"
         "- Do not mention recording unless the task says to.\n"
         "- Do not ask 'how can I help you?'; you placed the call.\n"
         "- Close warmly, e.g. " + _ex(code,
@@ -308,7 +334,7 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         "Hard constraints:\n"
         "- Do not call tools that are not available to you.\n"
         "- Do not invent facts not present in the task or said by the callee.\n"
-        "- Do not provide Colin's personal details, email, phone, address, or payment information.\n"
+        "- Do not provide the personal details of the person you are calling for — no email, phone, address, or payment information.\n"
         "- If asked for personal contact or payment details, say you do not have those available for this inquiry.\n"
         "- If the callee asks to book or confirm and booking is not allowed, politely decline and say you are only checking information for now.\n"
         "\n"
@@ -391,8 +417,8 @@ def build_assistant_prompt(spec: BusinessCallSpec, memory_digest: str = "") -> s
         "don't know where they are, ask once where to search near.\n"
         "- Place phone calls for them. When they ask you to 'call X and …' — call a "
         "cafe to order a matcha latte, call a restaurant to ask about availability, "
-        "call a shop to check stock — you MUST actually call the place_call tool. "
-        "This is NOT optional and saying you'll call is NOT enough: an actual call "
+        "call a shop to check stock — confirm first, then actually call the place_call "
+        "tool. Saying you'll call is NOT enough: an actual call "
         "only happens when you invoke place_call. NEVER say 'I'm placing the call', "
         "'I'll call them now', or 'I'll text you the result' unless you have called "
         "place_call in this same turn and it returned success. If you only talk about "
@@ -402,19 +428,26 @@ def build_assistant_prompt(spec: BusinessCallSpec, memory_digest: str = "") -> s
         "NOT stay on the line for it. Steps: (1) if you don't already have the number, "
         "call find_business to look up the place and its VERIFIED phone number — use "
         "find_business, NOT web_search, for anything you intend to call; web_search "
-        "phone numbers are unreliable. (2) call place_call with that number in E.164 "
-        "(include the country code, e.g. +1 for US numbers), a one-or-two-sentence task "
-        "describing exactly what to do, the business_name, and allow_booking=true if "
-        "it's an order/booking/reservation; (3) ONLY after place_call returns success, "
+        "phone numbers are unreliable. (2) READ BACK the business name, the number, and "
+        "what you'll ask for in one short sentence, and ask whether to go ahead — e.g. "
+        "'So that's Blue Bottle at +1 415 555 0134, ordering one matcha latte for "
+        "pickup — shall I call?'. A real call is irreversible and their speech may "
+        "have been misheard, so NEVER skip this read-back, even if the request sounded "
+        "clear. (3) ONLY after they clearly say yes, call place_call with "
+        "confirmed=true, the number in E.164 (include the country code, e.g. +1 for US "
+        "numbers), a one-or-two-sentence task describing exactly what to do, the "
+        "business_name, and allow_booking=true if it's an order/booking/reservation. "
+        "If they say no or correct a detail, fix it and read it back again. "
+        "(4) ONLY after place_call returns success, "
         "tell them you're placing the call now and will text them the result. If the "
         "tool returns an error, tell them the call didn't go through — do not pretend it "
         "worked. If they ask you to 'find the X near Y and call the best/highest-rated "
         "one', call find_business (it returns candidates ranked best-first with phone "
-        "numbers), pick the top one that has a phone, and place_call to it — don't ask "
-        "them to look it up themselves, and don't invent a number. If find_business "
-        "returns nothing dialable, tell them you couldn't find a number to call. If you "
-        "know their location (e.g. a hotel) from memory, use it; otherwise ask once "
-        "where they are.\n"
+        "numbers), pick the top one that has a phone, and read THAT one back to confirm "
+        "— don't ask them to look it up themselves, and don't invent a number. If "
+        "find_business returns nothing dialable, tell them you couldn't find a number "
+        "to call. If you know their location (e.g. a hotel) from memory, use it; "
+        "otherwise ask once where they are.\n"
         "- Otherwise just chat helpfully and briefly.\n"
         "\n"
         "Voice behavior:\n"

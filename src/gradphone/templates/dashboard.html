@@ -14,12 +14,6 @@
       <span class="viewer-tag">{{ viewer_name }}</span>
     </div>
     <div class="meta">
-      {% if quota_limit is not none %}
-        <span class="quota-chip" title="Today's call count vs your daily quota">
-          {{ quota_used }} / {{ quota_limit }} <span class="quota-suffix">today</span>
-        </span>
-        &nbsp;·&nbsp;
-      {% endif %}
       <span id="bridge-status">●</span>
       &nbsp; bridge {{ bridge_host }}
       &nbsp;·&nbsp; <a href="/ui/logout">sign out</a>
@@ -92,15 +86,6 @@
         <div id="history"><div class="empty">no calls yet — try one</div></div>
       </div>
 
-      {% if is_operator %}
-      <div class="section">
-        <h2 class="section-title">
-          <span>Tenants</span>
-          <span class="count" id="tenantcount">00</span>
-        </h2>
-        <div id="tenants"><div class="empty">no registered tenants yet</div></div>
-      </div>
-      {% endif %}
     </section>
   </main>
 
@@ -109,6 +94,7 @@
       <h3 id="modalTitle">Call result</h3>
       <div class="subtle" id="modalSubtitle">room</div>
       <dl id="modalBody"></dl>
+      <div id="modalLatency"></div>
       <button class="close" onclick="closeModal()">Close</button>
     </div>
   </div>

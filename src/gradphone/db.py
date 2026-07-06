@@ -130,7 +130,22 @@ def get_engine() -> AsyncEngine:
             # NullPool: no connection is held across calls, so the engine is
             # safe to reuse from different event loops (the test suite runs
             # each coroutine under its own asyncio.run).
-            engine = create_async_engine(url, poolclass=NullPool)
+            engine = create_async_engine(
+                url, poolclass=NullPool, connect_args={"timeout": 30}
+            )
+
+            # Two processes (bot + bridge) write this file concurrently. The
+            # sqlite defaults (rollback journal, no busy wait) make that raise
+            # "database is locked" whenever writes overlap; WAL lets readers
+            # and one writer coexist, and busy_timeout makes a second writer
+            # wait instead of failing.
+            @sa.event.listens_for(engine.sync_engine, "connect")
+            def _sqlite_pragmas(dbapi_conn, _record):
+                cursor = dbapi_conn.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=30000")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.close()
         else:
             engine = create_async_engine(
                 url,

@@ -217,7 +217,10 @@ def setkv(t, k, v):
 t = setkv(t, 'BRIDGE_API_KEY', secrets.token_urlsafe(36))   # self-generated, not an external key
 t = setkv(t, 'TWILIO_MACHINE_DETECTION', 'Disable')         # snappier local calls
 t = setkv(t, 'ENABLE_INBOUND', 'true')                      # answer inbound calls
-t = setkv(t, 'ALLOW_ARBITRARY_OUTBOUND', 'true')            # solo dev: allow /callme to any number
+# Outbound stays default-closed (ALLOW_ARBITRARY_OUTBOUND=false from
+# .env.example): /callme to your own saved number always works, and any other
+# destination must be added to OUTBOUND_ALLOWLIST deliberately — an agent
+# speaking in a cloned voice must not be able to dial arbitrary numbers.
 p.write_text(t)
 PY
   ok "generated BRIDGE_API_KEY and set local-dev defaults"
@@ -231,7 +234,6 @@ Open ${c_b}.env${c_reset} and fill these in (everything else is ready):
 
   ${c_b}Required${c_reset}
     GRADIUM_API_KEY         Gradium key — STT/TTS/voice cloning      (gsk_…)
-    AGENT_VOICE_ID          a voice UID in your Gradium account
     LLM_BASE_URL + LLM_MODEL    OpenAI-compatible endpoint  (or set OPENAI_API_KEY)
     TELEGRAM_BOT_TOKEN      from @BotFather
     ALLOWED_TELEGRAM_IDS    your Telegram user id (from @userinfobot)

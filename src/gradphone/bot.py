@@ -334,15 +334,11 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     room = out
     await query.message.reply_text(
-        f"Call placed (room: <code>{html.escape(room)}</code>). Waiting for result…",
+        f"Call placed (room: <code>{html.escape(room)}</code>). "
+        "I'll post the result here when the call ends.",
         parse_mode="HTML",
     )
-    data = await wait_for_result(room)
-    formatted = _format_result(data)
-    await query.message.reply_text(
-        f"<pre>{html.escape(formatted)}</pre>",
-        parse_mode="HTML",
-    )
+    _spawn_bg(_report_call_result(query.message, room))
     return ConversationHandler.END
 
 
@@ -354,6 +350,33 @@ async def cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> int:
 # Background tasks must be referenced or asyncio may garbage-collect them
 # mid-flight. /callme spawns a poller per call; keep a strong ref until done.
 _BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> None:
+    """Run a coroutine as a referenced background task (see _BG_TASKS)."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def _report_call_result(message, room: str) -> None:
+    """Poll the bridge for a business call's result and post it to the chat.
+
+    Runs as a background task: a call can take minutes, and awaiting it inside
+    the confirm handler would hold that update slot (and before concurrent
+    updates, the entire bot) hostage until the call ended."""
+    try:
+        data = await wait_for_result(room)
+        formatted = _format_result(data)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("call result poll failed for room=%s: %s", room, exc)
+        return
+    try:
+        await message.reply_text(
+            f"<pre>{html.escape(formatted)}</pre>", parse_mode="HTML"
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("call result notify failed for room=%s: %s", room, exc)
 
 # A /callme call can't outlive the bridge's MAX_CALL_DURATION_SECONDS (180 for
 # the workshop). 220s comfortably covers a full-length connected call plus the
@@ -454,7 +477,14 @@ async def callme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=contact_kb,
             )
             return
-    await update.message.reply_text(f"Calling you at {to} in assistant mode…")
+    await _place_callme(update.message, context, tenant, to)
+
+
+async def _place_callme(message, context: ContextTypes.DEFAULT_TYPE, tenant: dict, to: str) -> None:
+    """Dial the tenant in assistant mode and watch the outcome in the
+    background. Shared by the /callme command and the natural-language
+    confirm-card path."""
+    await message.reply_text(f"Calling you at {to} in assistant mode…")
     out = await dial(
         to=to,
         reason="personal assistant call",
@@ -463,9 +493,9 @@ async def callme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mode="assistant",
     )
     if out.startswith("Error"):
-        await update.message.reply_text(out)
+        await message.reply_text(out)
         return
-    await update.message.reply_text(
+    await message.reply_text(
         f"Call placed (room: <code>{html.escape(out)}</code>). "
         "Pick up and say e.g. “summarize my emails this week.”",
         parse_mode="HTML",
@@ -473,11 +503,52 @@ async def callme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Poll for the outcome in the background so a busy / no-answer / voicemail
     # result is reported instead of leaving the user staring at "pick up" for a
     # call that never connected. Background so other commands aren't blocked.
-    task = asyncio.create_task(
-        _report_callme_outcome(context, update.effective_chat.id, to, out)
+    _spawn_bg(_report_callme_outcome(context, message.chat_id, to, out))
+
+
+async def _callme_intent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Natural-language "call me": ask for one tap before dialing. The typed
+    /callme command dials immediately (explicit intent), but a classifier
+    guess on free text must not phone anyone without confirmation."""
+    user = update.effective_user
+    msg = update.effective_message
+    tenant = await _fetch_tenant(user.id) if user else None
+    if not tenant:
+        await msg.reply_text("Run /register first.")
+        return
+    if not tenant.get("is_active", 1):
+        await msg.reply_text("Your account is inactive. Contact the operator.")
+        return
+    to = ((tenant.get("phone")) or "").strip()
+    if not to:
+        # No saved number yet — /callme already handles the share-contact prompt.
+        await callme(update, context)
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📞 Yes, call me", callback_data="callme:yes"),
+        InlineKeyboardButton("Cancel", callback_data="callme:no"),
+    ]])
+    await msg.reply_text(
+        f"Sounds like you'd like me to call you at {to} — should I?",
+        reply_markup=kb,
     )
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def callme_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Confirm/cancel the natural-language call-me card."""
+    query = update.callback_query
+    await query.answer()
+    if query.data != "callme:yes":
+        await query.edit_message_text("Okay — no call.")
+        return
+    user = update.effective_user
+    tenant = await _fetch_tenant(user.id) if user else None
+    to = (((tenant or {}).get("phone")) or "").strip()
+    if not tenant or not to:
+        await query.edit_message_text("I don't have your number anymore — send /callme.")
+        return
+    await query.edit_message_text(f"Okay — calling you at {to}.")
+    await _place_callme(query.message, context, tenant, to)
 
 
 async def history(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -674,7 +745,7 @@ async def _route_intent(intent: str, update: Update, context: ContextTypes.DEFAU
     if intent == "translate":
         await translate(update, context)
     elif intent == "callme":
-        await callme(update, context)
+        await _callme_intent(update, context)
     elif intent == "history":
         await history(update, context)
     elif intent == "status":
@@ -779,13 +850,11 @@ async def oscall_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     room = out
     await query.message.reply_text(
-        f"Call placed (room: <code>{html.escape(room)}</code>). Waiting for result…",
+        f"Call placed (room: <code>{html.escape(room)}</code>). "
+        "I'll post the result here when the call ends.",
         parse_mode="HTML",
     )
-    data = await wait_for_result(room)
-    await query.message.reply_text(
-        f"<pre>{html.escape(_format_result(data))}</pre>", parse_mode="HTML",
-    )
+    _spawn_bg(_report_call_result(query.message, room))
 
 
 async def handle_text_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1031,7 +1100,10 @@ def main() -> None:
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN env var is required")
 
-    app = Application.builder().token(token).build()
+    # concurrent_updates: without it PTB processes updates strictly one at a
+    # time, so any handler that awaits something slow (an LLM reply, a result
+    # poll) freezes the bot for every other user and command.
+    app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_handler(TypeHandler(_Update, _gatekeeper), group=-1)
     app.add_error_handler(_on_error)
 
@@ -1061,6 +1133,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(clone_consent, pattern=r"^clone_consent:"))
     app.add_handler(CallbackQueryHandler(translate_pick_language, pattern=r"^xlate:"))
     app.add_handler(CallbackQueryHandler(oscall_confirm, pattern=r"^oscall:"))
+    app.add_handler(CallbackQueryHandler(callme_confirm, pattern=r"^callme:"))
     app.add_handler(conv)
     # Free-text chat — registered AFTER conv so the /call flow's text steps
     # take precedence while that conversation is active.

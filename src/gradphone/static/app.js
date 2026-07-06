@@ -4,7 +4,6 @@
 
 const LIVE_POLL_MS = 3000;
 const HISTORY_POLL_MS = 10000;
-const TENANTS_POLL_MS = 15000;
 const RESULT_POLL_MS = 5000;
 const RESULT_DEADLINE_MS = 10 * 60 * 1000;
 
@@ -36,10 +35,99 @@ function openResultModal(room, result) {
   if (result.answered_by) rows.push(["answered by", result.answered_by]);
   if (result.twilio_call_status) rows.push(["twilio status", result.twilio_call_status]);
   body.innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join("");
+  $("modalLatency").innerHTML = latencyHtml(result.latency);
   $("modalbackdrop").classList.add("visible");
 }
 function closeModal() { $("modalbackdrop").classList.remove("visible"); }
 window.closeModal = closeModal;
+
+// Open the result modal for any call by room (used by history rows).
+async function openRoomResult(room) {
+  const data = await getJson(`/ui/result/${encodeURIComponent(room)}`);
+  if (!data) return;
+  if (data.status === "complete") {
+    openResultModal(room, data.result);
+  } else {
+    toast(`No result yet for ${room} (${data.status || "pending"})`);
+  }
+}
+window.openRoomResult = openRoomResult;
+
+// ─── Latency breakdown ───────────────────────────────────
+// The cascade stages, in speaking order. STT + TTS are Gradium models;
+// LLM is the configured text model; tool is bridge-measured I/O.
+const LAT_STAGES = [
+  { key: "stt",  label: "STT",  cls: "gradium" },
+  { key: "llm",  label: "LLM",  cls: "model" },
+  { key: "tool", label: "Tool", cls: "tool" },
+  { key: "tts",  label: "TTS",  cls: "gradium" },
+];
+
+function fmtMs(v) {
+  if (v === null || v === undefined) return "—";
+  return v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${Math.round(v)}ms`;
+}
+
+function latencyHtml(latency) {
+  if (!latency || !latency.turns || !latency.turns.length) {
+    return `<div class="lat-empty">No per-turn latency captured for this call.</div>`;
+  }
+  const agg = latency.aggregates || {};
+  const med = (k) => (agg[k] && agg[k].median != null ? agg[k].median : null);
+  // Stacked bar of median stage times (only stages with a value).
+  const segs = LAT_STAGES.map((s) => ({ ...s, ms: med(s.key) })).filter((s) => s.ms != null);
+  const barTotal = segs.reduce((a, s) => a + s.ms, 0) || 1;
+  const bar = segs.map((s) =>
+    `<span class="lat-seg ${s.cls}" style="width:${(s.ms / barTotal * 100).toFixed(1)}%"
+           title="${s.label} median ${fmtMs(s.ms)}"></span>`
+  ).join("");
+  const legend = LAT_STAGES.map((s) =>
+    `<span class="lat-key"><i class="lat-dot ${s.cls}"></i>${s.label}
+       <b>${fmtMs(med(s.key))}</b></span>`
+  ).join("");
+  const respMed = med("response");
+
+  const rows = latency.turns
+    .filter((t) => t.turn >= 0)
+    .map((t) => `
+      <tr>
+        <td>${t.turn}</td>
+        <td>${fmtMs(t.stt_ms)}</td>
+        <td>${fmtMs(t.llm_ms)}</td>
+        <td>${fmtMs(t.tool_ms)}${toolNames(t.tools)}</td>
+        <td>${fmtMs(t.tts_ms)}</td>
+        <td class="lat-total">${fmtMs(t.response_ms)}</td>
+      </tr>`).join("");
+
+  return `
+    <div class="lat-head">
+      <span class="lat-title">Latency — median per turn</span>
+      ${respMed != null ? `<span class="lat-resp">response ${fmtMs(respMed)}</span>` : ""}
+    </div>
+    <div class="lat-bar">${bar}</div>
+    <div class="lat-legend">${legend}</div>
+    <table class="lat-table">
+      <thead><tr><th>Turn</th><th>STT</th><th>LLM</th><th>Tool</th><th>TTS</th><th>Response</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="lat-caption">
+      Measured at the bridge from gradbot event arrival times. STT + TTS are
+      Gradium; LLM is the configured text model; tool is dispatch→result.
+    </div>`;
+}
+
+function toolNames(tools) {
+  if (!tools || !tools.length) return "";
+  const names = tools.map((t) => t.name).join(", ");
+  return `<span class="lat-tools">${escapeHtml(names)}</span>`;
+}
+
+// Compact chip for a call's median response latency (live + history rows).
+function latencyChip(latency) {
+  const m = latency && latency.aggregates && latency.aggregates.response;
+  if (!m || m.median == null) return "";
+  return `<span class="lat-chip" title="median response (transcript→first audio)">⧗ ${fmtMs(m.median)}</span>`;
+}
 
 // ─── HTML escaping ───────────────────────────────────────
 function escapeHtml(s) {
@@ -81,7 +169,7 @@ function renderLive(calls) {
           <span class="lang-tag">${escapeHtml(c.language || "en")}</span>
           <span class="task">${escapeHtml(c.business_name || c.room || "")}</span></td>
       <td><span class="phase">${escapeHtml(c.phase || "—")}</span></td>
-      <td><span class="ts">${(c.age_seconds || 0).toFixed(0)}s</span></td>
+      <td><span class="ts">${(c.age_seconds || 0).toFixed(0)}s</span> ${latencyChip(c.latency)}</td>
     </tr>
   `).join("");
   container.innerHTML = `
@@ -113,10 +201,11 @@ function renderHistory(calls) {
     const dur = c.duration_seconds ? `${c.duration_seconds.toFixed(0)}s` : "—";
     const answer = c.answer ? `<span class="answer">${escapeHtml(c.answer)}</span>` : "";
     const audioBtn = c.room
-      ? `<a href="#" onclick="event.preventDefault(); playAudio('${escapeHtml(c.room)}')">▶ audio</a>`
+      ? `<a href="#" onclick="event.stopPropagation(); event.preventDefault(); playAudio('${escapeHtml(c.room)}')">▶ audio</a>`
       : "";
+    const roomAttr = c.room ? `onclick="openRoomResult('${escapeHtml(c.room)}')" class="clickable" title="Latency + result"` : "";
     return `
-      <tr>
+      <tr ${roomAttr}>
         <td><span class="dest">${escapeHtml(c.destination || "?")}</span>
             <span class="lang-tag">${escapeHtml(c.language || "en")}</span>
             <span class="task">${escapeHtml(c.task || "")}</span>
@@ -140,79 +229,6 @@ async function refreshHistory() {
   if (!data) return;
   renderHistory(data.calls || []);
 }
-
-// ─── Tenants (operator only) ─────────────────────────────
-function renderTenants(rows) {
-  const container = $("tenants");
-  if (!container) return;
-  $("tenantcount").textContent = String(rows.length).padStart(2, "0");
-  if (!rows.length) {
-    container.innerHTML = `<div class="empty">no registered tenants yet</div>`;
-    return;
-  }
-  const trs = rows.map((t) => {
-    const active = !!t.is_active;
-    const usage = `${t.calls_today || 0} / ${t.effective_quota || 0}`;
-    const inFlight = t.in_flight || 0;
-    const toggleLabel = active ? "Deactivate" : "Activate";
-    return `
-      <tr data-tid="${t.id}">
-        <td><span class="dest">${escapeHtml(t.name || "—")}</span>
-            <span class="task">telegram_id=${escapeHtml(String(t.telegram_id || "—"))}</span></td>
-        <td><span class="ts">${escapeHtml(usage)} today</span><br>
-            <span class="ts">${inFlight} in flight</span></td>
-        <td>
-          <span class="status ${active ? 'answered' : 'failed'}">${active ? 'active' : 'disabled'}</span>
-        </td>
-        <td>
-          <a href="#" onclick="event.preventDefault(); toggleTenant(${t.id}, ${active ? 0 : 1})">${toggleLabel}</a><br>
-          <a href="#" onclick="event.preventDefault(); editQuota(${t.id}, ${t.custom_calls_per_day === null ? 'null' : t.custom_calls_per_day})">Quota</a>
-        </td>
-      </tr>
-    `;
-  }).join("");
-  container.innerHTML = `
-    <table>
-      <thead><tr><th>Tenant</th><th>Usage</th><th>State</th><th>Actions</th></tr></thead>
-      <tbody>${trs}</tbody>
-    </table>
-  `;
-}
-
-async function refreshTenants() {
-  if (!IS_OPERATOR) return;
-  const data = await getJson("/ui/tenants");
-  if (!data) return;
-  renderTenants(data.tenants || []);
-}
-
-window.toggleTenant = async function (tid, newActive) {
-  const r = await postJson(`/ui/tenants/${tid}/update`, { is_active: !!newActive });
-  if (r && r.ok) {
-    toast(`Tenant ${tid} ${newActive ? "activated" : "deactivated"}.`);
-    refreshTenants();
-  } else {
-    toast(`Update failed: ${r && r.error}`);
-  }
-};
-
-window.editQuota = async function (tid, current) {
-  const ans = prompt(
-    `Custom daily quota for tenant ${tid} (blank = use default, 0 = clear override):`,
-    current === null ? "" : String(current),
-  );
-  if (ans === null) return;
-  const trimmed = ans.trim();
-  const r = await postJson(`/ui/tenants/${tid}/update`, {
-    custom_calls_per_day: trimmed === "" ? null : Number(trimmed),
-  });
-  if (r && r.ok) {
-    toast(`Quota updated.`);
-    refreshTenants();
-  } else {
-    toast(`Update failed: ${r && r.error}`);
-  }
-};
 
 // ─── Audio playback ──────────────────────────────────────
 let activeAudio = null;
@@ -347,8 +363,6 @@ window.clearVoice = async function () {
 // ─── Boot ────────────────────────────────────────────────
 refreshLive();
 refreshHistory();
-refreshTenants();
 refreshVoice();
 setInterval(refreshLive, LIVE_POLL_MS);
 setInterval(refreshHistory, HISTORY_POLL_MS);
-if (IS_OPERATOR) setInterval(refreshTenants, TENANTS_POLL_MS);

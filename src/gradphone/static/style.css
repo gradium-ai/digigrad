@@ -632,6 +632,118 @@ audio {
 }
 .modal .close:hover { color: var(--fg); border-color: var(--fg); }
 
+/* ─── Latency breakdown (modal) ─────────────────────────── */
+
+#modalLatency:not(:empty) {
+  margin-top: 26px;
+  padding-top: 22px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.lat-empty {
+  color: var(--fg-faint);
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 14px;
+}
+
+.lat-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.lat-title {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 16px;
+  color: var(--fg);
+}
+.lat-resp {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--amber);
+  font-variant-numeric: tabular-nums;
+}
+
+.lat-bar {
+  display: flex;
+  width: 100%;
+  height: 12px;
+  background: var(--bg-soft);
+  border: 1px solid var(--line);
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+.lat-seg { height: 100%; }
+.lat-seg.gradium { background: var(--green); }
+.lat-seg.model   { background: var(--gray); }
+.lat-seg.tool    { background: var(--amber); }
+
+.lat-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 18px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.lat-key { display: flex; align-items: center; gap: 6px; letter-spacing: 0.08em; text-transform: uppercase; }
+.lat-key b { color: var(--fg); font-weight: 500; font-variant-numeric: tabular-nums; }
+.lat-dot { width: 9px; height: 9px; display: inline-block; }
+.lat-dot.gradium { background: var(--green); }
+.lat-dot.model   { background: var(--gray); }
+.lat-dot.tool    { background: var(--amber); }
+
+.lat-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.lat-table th {
+  text-align: right;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+.lat-table th:first-child { text-align: left; }
+.lat-table td {
+  text-align: right;
+  padding: 7px 10px 7px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+}
+.lat-table td:first-child { text-align: left; color: var(--fg-faint); }
+.lat-table td.lat-total { color: var(--fg); font-weight: 500; }
+.lat-table tr:last-child td { border-bottom: none; }
+.lat-tools {
+  display: block;
+  font-size: 9px;
+  color: var(--fg-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.lat-caption {
+  margin-top: 14px;
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--fg-faint);
+}
+
+.lat-chip {
+  display: inline-block;
+  font-size: 10px;
+  color: var(--amber);
+  border: 1px solid var(--line);
+  padding: 0 6px;
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+  vertical-align: 1px;
+}
+
+tbody tr.clickable { cursor: pointer; }
+
 /* ─── Toast notifications ───────────────────────────────── */
 
 .toast {

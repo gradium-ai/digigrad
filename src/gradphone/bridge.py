@@ -26,7 +26,7 @@ The gradbot session is configured with the same business prompt + tools
 as the LiveKit path (`build_business_prompt`, save_business_result, …).
 
 Audio is tee'd to mixed.wav under
-~/.openclaw/workspace/call-recordings/<room>/ so the dashboard
+~/.gradphone/call-recordings/<room>/ so the dashboard
 auto-discovers the call exactly like LiveKit calls. A `framework.txt`
 marker is written so the dashboard tags it as "gradbot" instead of the
 default "livekit".
@@ -83,7 +83,8 @@ from .business_agent import (
     contains_personal_detail,
     redact_personal_details,
 )
-from .config import cfg
+from .config import get_cfg
+from .latency import CallLatency
 from .voicemail import is_machine, voicemail_twiml
 
 __all__ = ["app", "dispatch_gradbot_call"]
@@ -98,9 +99,11 @@ logging.basicConfig(
 
 log = logging.getLogger(__name__)
 
-# Recording root — same path the LiveKit path writes to, so the dashboard
-# auto-discovery picks both up.
-WORKSPACE = Path.home() / ".openclaw" / "workspace"
+# Recording root — lives next to the SQLite DB under ~/.gradphone (override
+# with GRADPHONE_WORKSPACE, e.g. to a mounted disk on a hosted deploy).
+WORKSPACE = Path(
+    os.environ.get("GRADPHONE_WORKSPACE") or (Path.home() / ".gradphone")
+).expanduser()
 RECORDINGS_ROOT = WORKSPACE / "call-recordings"
 TRANSCRIPTS_ROOT = WORKSPACE / "call-transcripts"
 
@@ -170,7 +173,11 @@ async def _render_text_ulaw(voice_id: str, text: str) -> bytes | None:
             if base_url else gradium.GradiumClient(api_key=api_key)
         )
         setup = gradium.TTSSetup(model_name="default", voice_id=voice_id, output_format="wav")
-        result = await client.tts(setup, text)
+        # Bounded: this renders openers/fillers *inside* a live call, before
+        # the main audio loop starts — a hung TTS request here would hold the
+        # whole call in dead air. On timeout the call proceeds without the
+        # opener (same as any other render failure).
+        result = await asyncio.wait_for(client.tts(setup, text), timeout=6.0)
         wav = getattr(result, "raw_data", None)
         if not wav:
             return None
@@ -285,11 +292,14 @@ def _place_call_tool_def() -> Any:
         description=(
             "Place a NEW outbound phone call on the caller's behalf and have a "
             "second agent — speaking in the caller's own cloned voice — carry out "
-            "a task on that call. Use this WHENEVER the caller asks you to 'call "
+            "a task on that call. Use this when the caller asks you to 'call "
             "X and …' (e.g. call a cafe to order a matcha latte, call a restaurant "
-            "to ask about availability, call a shop to check stock). If you don't "
-            "already know the number, look it up FIRST with web_search (search for "
-            "the business name plus 'phone number'), then call this. You do NOT "
+            "to ask about availability, call a shop to check stock). Placing a "
+            "real call is irreversible, so BEFORE invoking this tool you MUST "
+            "read the business name, phone number, and task back to the caller "
+            "and get a clear yes — then pass confirmed=true. If you don't "
+            "already know the number, look it up first (use find_business when "
+            "available; web_search phone numbers are unreliable). You do NOT "
             "stay on the line — the call runs in the background and its result is "
             "texted to the caller on Telegram. After calling this tool, tell the "
             "caller you're placing the call now and will text them the result."
@@ -327,8 +337,16 @@ def _place_call_tool_def() -> Any:
                     "type": "string",
                     "description": "Call language as an ISO code (en, fr, pt). Defaults to this call's language.",
                 },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true ONLY after you read the business name, number, "
+                        "and task back to the caller on THIS call and they clearly "
+                        "agreed. The call is refused unless this is true."
+                    ),
+                },
             },
-            "required": ["to", "task"],
+            "required": ["to", "task", "confirmed"],
         }),
     )
 
@@ -554,6 +572,9 @@ class _CallState:
     # and every duplicate gets the SAME result (no contradictory answers).
     search_cache: dict = field(default_factory=dict)  # query_key -> (monotonic_ts, payload)
     search_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Per-turn cascade latency (STT/LLM/tool/TTS/total). Instantiated when the
+    # media stream opens so it shares the same monotonic anchor as stop_s.
+    latency: CallLatency | None = None
 
 
 _EVENT_LOG_CAP = 40
@@ -884,6 +905,42 @@ async def _post_call_followups(state: _CallState) -> None:
 
 # --- Tool-call handler --------------------------------------------------
 
+async def _run_tool_call(handle, state: _CallState, send_event, turn_idx=None) -> None:
+    """Run one tool call, guaranteeing the LLM always gets a response.
+
+    Each branch of _handle_tool_call handles its own expected failures, but
+    an *unexpected* exception (a DB hiccup in `remember`, a bug in a handler)
+    would otherwise die silently inside a fire-and-forget task — and gradbot
+    then waits forever on a tool result that never arrives: permanent dead
+    air on a live call. Catch everything, log it, and hand the model a
+    speakable error instead.
+
+    Also times the call wall-to-wall (dispatch → result returned) and records
+    it against the turn for the latency breakdown.
+    """
+    t0 = time.monotonic()
+    try:
+        await _handle_tool_call(handle, state, send_event)
+    except Exception:  # noqa: BLE001
+        log.exception(
+            "call %s | tool %s raised — sending error to model",
+            state.room_name, getattr(handle, "name", "?"),
+        )
+        try:
+            await handle.send_error(
+                "Tool failed unexpectedly — tell the caller you couldn't do "
+                "that right now and carry on."
+            )
+        except Exception:  # noqa: BLE001
+            log.warning("call %s | could not deliver tool error", state.room_name)
+    finally:
+        if state.latency is not None:
+            state.latency.on_tool(
+                turn_idx, getattr(handle, "name", "?"),
+                (time.monotonic() - t0) * 1000.0,
+            )
+
+
 async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
     """Dispatch a single gradbot tool call.
 
@@ -979,9 +1036,19 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         days = args.get("days") or 7
         max_results = args.get("max_results") or 25
         try:
-            messages = await asyncio.to_thread(
-                email_inbox.fetch_recent, days=days, max_results=max_results
+            # Same hard cap as web_search/find_business: a slow IMAP session
+            # must degrade to a spoken "couldn't read email", never dead air.
+            messages = await asyncio.wait_for(
+                asyncio.to_thread(
+                    email_inbox.fetch_recent, days=days, max_results=max_results
+                ),
+                timeout=12.0,
             )
+        except asyncio.TimeoutError:
+            log.warning("get_email_summary timed out")
+            _timeline_event(state, "email_summary", error="timeout")
+            await handle.send_json({"error": "Could not read email right now.", "configured": True})
+            return
         except email_inbox.EmailNotConfigured:
             # Keep the model-facing text generic; never echo credential/host
             # details into the spoken reply or the transcript.
@@ -1137,6 +1204,21 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
             log.warning("call %s | place_call REFUSED: no task", state.room_name)
             await handle.send_error("Refused: no task — say what the call should accomplish.")
             return
+        # Belt-and-braces on top of the prompt's confirm-first rule: dialing a
+        # real third party in the caller's cloned voice is irreversible, so a
+        # misheard or garbled request must never place a call. The model can
+        # only set confirmed=true after an explicit read-back + yes.
+        if not bool(args.get("confirmed")):
+            log.warning("call %s | place_call REFUSED: not confirmed", state.room_name)
+            _timeline_event(state, "place_call", to="+" + digits, error="not_confirmed")
+            await handle.send_json({
+                "success": False,
+                "error": "Not confirmed. Read the business name, number, and task "
+                         "back to the caller and ask if you should go ahead. Only "
+                         "if they clearly say yes, call place_call again with "
+                         "confirmed=true.",
+            })
+            return
         to = "+" + digits
         if not _outbound_destination_allowed(to):
             log.warning(
@@ -1253,7 +1335,7 @@ except Exception as e:  # noqa: BLE001
 # TwiML and WS endpoints). Three endpoint classes, each with its own
 # auth model:
 #
-# - /dial: callable by us (and eventually the gizmogrid portal). Requires
+# - /dial: callable by us (the bot and the web dashboard). Requires
 #   a long random bearer token in `BRIDGE_API_KEY` env. If the env var is
 #   unset, requests are allowed but a startup warning is logged — useful
 #   for local dev where the bridge is only reachable via 127.0.0.1.
@@ -1479,7 +1561,7 @@ async def diagnostics() -> dict:
         # Strip the trailing port for classification.
         ip = host.rsplit(":", 1)[0]
         if ip.startswith("127.") or ip == "::1":
-            classes["loopback"] += count       # gizmogrid → bridge polling, etc.
+            classes["loopback"] += count       # bot/dashboard → bridge polling, etc.
         elif ip.startswith("160.79."):
             classes["anthropic"] += count      # Anthropic API range
         elif "twilio" in host:
@@ -1518,6 +1600,9 @@ def _snapshot_call(state: _CallState, *, phase_override: str | None = None) -> d
         "stream_sid": state.stream_sid,
         "result_saved": bool(state.business_result),
         "events": events,
+        # Compact live latency: median response + last turn's stage breakdown,
+        # so the dashboard can show a moving number during the call.
+        "latency": state.latency.summary() if state.latency is not None else None,
     }
 
 
@@ -1806,12 +1891,10 @@ async def dial(spec_payload: dict) -> dict:
     if normalised_to == "+":
         return {"error": "Error: 'to' must contain digits"}
 
-    if not _outbound_destination_allowed(normalised_to):
-        log.warning("dial refused: %s not in OUTBOUND_ALLOWLIST", normalised_to)
-        return {
-            "error": "Error: destination not allowed. Ask the operator to add it to "
-                     "OUTBOUND_ALLOWLIST (or set ALLOW_ARBITRARY_OUTBOUND=true)."
-        }
+    # No allowlist check here: dispatch_gradbot_call is the single choke
+    # point, and it has the tenant context needed to allow a tenant's own
+    # saved number (so /callme works with the allowlist closed). A duplicate
+    # check here would refuse those calls before dispatch could allow them.
 
     tenant_id = spec_payload.get("tenant_id")
     if tenant_id is not None:
@@ -2057,6 +2140,9 @@ async def twilio_stream(websocket: fastapi.WebSocket):
 
     state.stream_sid = stream_sid
     state.stream_started_at = time.monotonic()
+    # Anchor latency accounting to the same monotonic clock stop_s is
+    # expressed against (media-clock seconds since stream open).
+    state.latency = CallLatency(stream_started_wall=state.stream_started_at)
     log.info("twilio_stream: bridge starting room=%s sid=%s", room, stream_sid)
     await _append_transcript(state, "SYSTEM", f"📤 Outbound call (gradbot) — room: {room}")
     # Emit business_prompt_build so the dashboard's discover_business_rooms()
@@ -2271,6 +2357,12 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 if kind == "audio":
                     nonlocal agent_resample_state
                     now = time.monotonic()
+                    # Latency: first audio frame of each turn (the accumulator
+                    # keeps only the first per turn_idx). Recorded before any
+                    # barge-in/dup-drop handling so it reflects when Gradium TTS
+                    # actually started producing audio, not whether we played it.
+                    if state.latency is not None:
+                        state.latency.on_first_audio(getattr(msg, "turn_idx", None), now)
                     interrupted = barge_in_on and getattr(msg, "interrupted", False)
                     # Don't treat the agent's own post-tool continuation as a
                     # caller barge-in (see tool_window note above).
@@ -2333,6 +2425,15 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 elif kind == "stt_text":
                     text = (getattr(msg, "text", "") or "").strip()
                     if text:
+                        # Latency: caller transcript finalized — start of the
+                        # turn's response clock. stop_s is the media-clock time
+                        # the caller stopped speaking (for the STT stage).
+                        if state.latency is not None:
+                            state.latency.on_stt(
+                                getattr(msg, "turn_idx", None),
+                                time.monotonic(),
+                                getattr(msg, "stop_s", None),
+                            )
                         # Stdout receipt so the live conversation is tailable in
                         # Render logs (no disk access needed to debug a call).
                         log.info("call %s | CALLER: %s", state.room_name, text)
@@ -2360,6 +2461,12 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 elif kind == "tts_text":
                     text = sanitize(getattr(msg, "text", "") or "")
                     if text:
+                        # Latency: first agent token of the turn ends the LLM
+                        # stage and starts the TTS-to-first-audio stage.
+                        if state.latency is not None:
+                            state.latency.on_agent_text(
+                                getattr(msg, "turn_idx", None), time.monotonic()
+                            )
                         log.info("call %s | AGENT: %s", state.room_name, text)
                         await _append_transcript(state, "AGENT", text)
                         state.transcript_turns.append(("agent", text))
@@ -2378,7 +2485,9 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     # Suppress barge-in around the tool so the answer-turn doesn't
                     # flush the in-progress preamble/filler (see tool_window note).
                     tool_window["until"] = time.monotonic() + tool_window_s
-                    task = asyncio.create_task(_handle_tool_call(handle, state, emit_event))
+                    task = asyncio.create_task(
+                        _run_tool_call(handle, state, emit_event, getattr(msg, "turn_idx", None))
+                    )
                     pending_tool_tasks.add(task)
                     task.add_done_callback(pending_tool_tasks.discard)
 
@@ -2567,6 +2676,7 @@ async def _emit_completion(state: _CallState) -> None:
             "duration_seconds": duration,
             "target_duration_ms": duration * 1000,
             "business_result": state.business_result or None,
+            "latency": state.latency.summary() if state.latency is not None else None,
         }, indent=2), encoding="utf-8")
     except OSError as e:
         log.warning("metrics write failed: %s", e)
@@ -2594,13 +2704,6 @@ async def dispatch_gradbot_call(
     ``tenant_id`` is recorded with the call row and used to release the
     rate-limit slot when the call ends. Operator-mode calls pass None.
     """
-    public_http_url = (
-        public_http_url
-        or os.environ.get("PUBLIC_HTTP_URL", "").rstrip("/")
-    )
-    if not public_http_url:
-        return "Error: PUBLIC_HTTP_URL not set — gradbot bridge needs a publicly reachable URL"
-
     # Normalise the destination to strict E.164 (digits + leading '+').
     # The dial form sometimes receives human-formatted numbers like
     # "+33 1 40 60 44 32"; without scrubbing, the spaces leak into the
@@ -2610,12 +2713,39 @@ async def dispatch_gradbot_call(
     if not digits:
         return "Error: 'to' must contain at least one digit"
     to = "+" + digits
+    # One early tenant lookup serves both the own-number allowance below and
+    # the voice-clone selection further down.
+    tenant_row: dict | None = None
+    if tenant_id is not None:
+        try:
+            tenant_row = await tenants.get_tenant_by_id(tenant_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning("tenant lookup failed for tenant_id=%s: %s", tenant_id, e)
+    own_digits = "".join(
+        ch for ch in ((tenant_row or {}).get("phone") or "") if ch.isdigit()
+    )
     # Enforce the destination allowlist at the choke point every outbound path
     # funnels through (so /dial and the place_call tool are both covered).
-    # Default-closed: see _outbound_destination_allowed.
-    if not _outbound_destination_allowed(to):
+    # Default-closed: see _outbound_destination_allowed. Exception: a tenant's
+    # own saved number is always dialable, so /callme works out of the box
+    # without opening arbitrary outbound dialing.
+    if not _outbound_destination_allowed(to) and (not own_digits or digits != own_digits):
         log.warning("dispatch refused: %s not allowed by OUTBOUND_ALLOWLIST", to)
         return "Error: destination not allowed (set OUTBOUND_ALLOWLIST or ALLOW_ARBITRARY_OUTBOUND)"
+    # Reachability + Twilio creds are validated lazily (a Telegram-only
+    # deployment never needs them); fail here — after the allowlist verdict,
+    # which is the more meaningful refusal — and before any call state is
+    # registered.
+    public_http_url = (
+        public_http_url
+        or os.environ.get("PUBLIC_HTTP_URL", "").rstrip("/")
+    )
+    if not public_http_url:
+        return "Error: PUBLIC_HTTP_URL not set — gradbot bridge needs a publicly reachable URL"
+    try:
+        cfg = get_cfg()
+    except RuntimeError as e:
+        return f"Error: {e}"
     # 16 random bytes so a pending room name can't be guessed and used to attach
     # to the Media Streams WebSocket before the real call connects.
     room_name = f"outbound-{digits}_{os.urandom(16).hex()}"
@@ -2628,13 +2758,7 @@ async def dispatch_gradbot_call(
 
     # If the tenant has a cloned voice, use it. Operator calls (tenant_id=None)
     # fall through to the default _VOICE_ID per-language.
-    voice_id_override: str | None = None
-    if tenant_id is not None:
-        try:
-            t = await tenants.get_tenant_by_id(tenant_id)
-            voice_id_override = (t or {}).get("voice_id") or None
-        except Exception as e:  # noqa: BLE001
-            log.warning("tenant lookup for voice_id failed: %s", e)
+    voice_id_override: str | None = (tenant_row or {}).get("voice_id") or None
 
     state = _CallState(
         spec=spec,
@@ -2668,26 +2792,32 @@ async def dispatch_gradbot_call(
     else:
         twilio = TwilioClient(cfg.twilio_account_sid, cfg.twilio_auth_token)
 
-    # Phone number: env override wins (Gradbots project has its own number),
-    # otherwise fall back to the gizmo-voice-agent's TWILIO_PHONE_NUMBER.
+    # Phone number: TWILIO_FROM_NUMBER override wins, otherwise the
+    # deployment's TWILIO_PHONE_NUMBER.
     from_number = os.environ.get("TWILIO_FROM_NUMBER") or cfg.twilio_phone_number
 
     # Voicemail detection — Twilio decides synchronously (~3s) whether the
     # answerer is a human or machine, and surfaces the verdict via the
-    # AnsweredBy form field on the TwiML POST + status callbacks. Disable
-    # by setting TWILIO_MACHINE_DETECTION=disable.
-    machine_detection = os.environ.get("TWILIO_MACHINE_DETECTION", "Enable")
+    # AnsweredBy form field on the TwiML POST + status callbacks. Default
+    # Disable: a wrong "machine" verdict drops the call within seconds (the
+    # README's top troubleshooting entry), and voicemail drops are opt-in.
+    machine_detection = os.environ.get("TWILIO_MACHINE_DETECTION", "Disable")
 
     try:
-        call = twilio.calls.create(
-            to=to,
-            from_=from_number,
-            url=twiml_url,
-            method="POST",
-            status_callback=status_url,
-            status_callback_method="POST",
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-            machine_detection=machine_detection if machine_detection.lower() != "disable" else None,
+        # The Twilio SDK is synchronous (requests-based); run it in a thread
+        # so the REST round-trip can't stall the event loop that is streaming
+        # audio for every live call (place_call dispatches mid-call).
+        call = await asyncio.to_thread(
+            lambda: twilio.calls.create(
+                to=to,
+                from_=from_number,
+                url=twiml_url,
+                method="POST",
+                status_callback=status_url,
+                status_callback_method="POST",
+                status_callback_event=["initiated", "ringing", "answered", "completed"],
+                machine_detection=machine_detection if machine_detection.lower() != "disable" else None,
+            )
         )
     except Exception as e:  # noqa: BLE001
         # Roll back the pending entry so we don't leak state.

@@ -87,9 +87,6 @@ You'll sign up for four services. Here's each key and how to get it.
 
 1. Sign in at **gradium.ai** and open the dashboard.
 2. Create an **API key** (`gsk_…`) → `GRADIUM_API_KEY`.
-3. Pick any **voice UID** in your account (a built-in is fine) → `AGENT_VOICE_ID`.
-   This is the default voice before *your* clone exists; the app won't start
-   without it. Your personal clone is created later in Telegram and overrides it.
 
 **LLM provider** — the "brain" · *required*
 
@@ -136,12 +133,17 @@ app password from myaccount.google.com/apppasswords), `GOOGLE_PLACES_API_KEY`
 ### 3. Paste the keys into `.env`
 
 Open `.env` and fill in what you created. Everything else (`BRIDGE_API_KEY`,
-`TWILIO_MACHINE_DETECTION=Disable`, `ENABLE_INBOUND=true`,
-`ALLOW_ARBITRARY_OUTBOUND=true`) is already set by `setup.sh` — don't touch it.
+`TWILIO_MACHINE_DETECTION=Disable`, `ENABLE_INBOUND=true`) is already set by
+`setup.sh` — don't touch it.
+
+Outbound dialing is **closed by default**: `/callme` to your own saved number
+always works, but any other destination (e.g. "call the cafe and order…") must
+be listed in `OUTBOUND_ALLOWLIST`, or you must explicitly set
+`ALLOW_ARBITRARY_OUTBOUND=true`. An agent speaking in a cloned voice should
+not be able to dial arbitrary numbers by accident.
 
 ```bash
 GRADIUM_API_KEY=gsk_...
-AGENT_VOICE_ID=...
 
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini

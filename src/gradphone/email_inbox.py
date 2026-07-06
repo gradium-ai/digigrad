@@ -90,7 +90,10 @@ def fetch_recent(days: int = 7, max_results: int = 25, mailbox: str = "INBOX") -
 
     conn: imaplib.IMAP4_SSL | None = None
     try:
-        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+        # Socket timeout: without it the stdlib default is block-forever, and
+        # a wedged connection here means dead air on a live call (the caller
+        # asked for their email summary and nothing ever comes back).
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=10)
         conn.login(address, password)
         conn.select(mailbox, readonly=True)
         typ, data = conn.search(None, f'(SINCE {since})')

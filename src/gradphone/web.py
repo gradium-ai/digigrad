@@ -12,10 +12,9 @@ signs them with the shared BRIDGE_API_KEY so the bridge can verify
 them). Links expire in 5 minutes; the session cookie they set lasts a
 week.
 
-Operator-only endpoints (tenant management) sit at /ui/tenants and
-/ui/tenant/{id}/update. Tenant-scoped data routes (/ui/dial,
-/ui/history, /ui/calls/live, /ui/result, /ui/audio) work for either
-role and self-scope based on session.
+Tenant-scoped data routes (/ui/dial, /ui/history, /ui/calls/live,
+/ui/result, /ui/audio) work for either role and self-scope based on
+session.
 """
 
 from __future__ import annotations
@@ -179,8 +178,6 @@ async def dashboard_root(request: Request):
             "viewer_name": viewer_name,
             "is_operator": operator,
             "tenant_id": tenant_id,
-            "quota_used": None,
-            "quota_limit": None,
         },
     )
 
