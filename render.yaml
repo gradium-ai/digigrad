@@ -1,0 +1,79 @@
+# Render Blueprint — gradphone, single-service deploy.
+#
+# One Docker web service runs BOTH processes via start.sh:
+#   • bridge — Twilio webhooks + Media-Stream WS + dashboard, binds $PORT
+#   • bot    — Telegram onboarding / chat, auto-restarting in the background
+#
+# start.sh derives PUBLIC_HTTP_URL / PUBLIC_WS_URL from RENDER_EXTERNAL_URL,
+# so no tunnel is involved and the public URL is stable across deploys.
+#
+# State: HOME=/data puts SQLite (~/.gradphone/gradphone.db) and the call
+# recordings/transcripts (~/.gradphone/…) on the persistent disk, so history
+# and voice-clone registrations survive restarts and deploys.
+#
+# One-time step after the first deploy: point the Twilio number's voice
+# webhook at  https://<service>.onrender.com/twilio/voice  (POST).
+services:
+  - type: web
+    name: gradphone
+    runtime: docker
+    plan: starter          # disks require a paid instance; starter is enough
+    healthCheckPath: /healthz
+    autoDeploy: true
+    disk:
+      name: gradphone-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: HOME
+        value: /data
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Self-generated bearer/signing secret — never committed anywhere.
+      - key: BRIDGE_API_KEY
+        generateValue: true
+      # Safe demo defaults (see .env.example for what each does).
+      - key: TWILIO_MACHINE_DETECTION
+        value: Disable
+      - key: ENABLE_INBOUND
+        value: "true"
+      - key: ALLOW_ARBITRARY_OUTBOUND
+        value: "false"
+      - key: MAX_CALL_DURATION_SECONDS
+        value: "600"
+      - key: GRADBOT_MAX_CONCURRENT
+        value: "3"
+      # ── Required secrets — Render prompts for these on blueprint sync ──
+      - key: GRADIUM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_TELEGRAM_IDS
+        sync: false
+      - key: OPERATOR_NAME
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      # ── Optional feature keys — leave blank to disable the feature ──
+      - key: LINKUP_API_KEY
+        sync: false
+      - key: GOOGLE_PLACES_API_KEY
+        sync: false
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: OPERATOR_EMAIL
+        sync: false
+      - key: OPERATOR_PHONE
+        sync: false

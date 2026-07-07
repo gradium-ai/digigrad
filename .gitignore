@@ -1,6 +1,8 @@
 .env
-.venv/
-.tools/
+# no trailing slash: also match the symlinked .venv/.tools a local
+# worktree may carry (dir-only patterns ignore symlinks)
+.venv
+.tools
 __pycache__/
 *.pyc
 *.pyo
