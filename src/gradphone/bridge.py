@@ -47,6 +47,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 import wave
 from collections import deque
@@ -62,7 +63,9 @@ try:  # pragma: no cover
     HAS_GRADBOT = True
 except ImportError:
     gradbot = None  # type: ignore[assignment]
-    sanitize = lambda x: x  # type: ignore[assignment]
+
+    def sanitize(x):  # type: ignore[misc] - passthrough when gradbot absent
+        return x
     HAS_GRADBOT = False
 
 import fastapi
@@ -77,7 +80,6 @@ from . import tenants
 from . import websearch
 from .business_agent import (
     BusinessCallSpec,
-    agent_name_for_language,
     build_assistant_prompt,
     build_business_prompt,
     build_gradium_prompt,
@@ -756,7 +758,6 @@ def _make_session_config(
     if not HAS_GRADBOT:
         raise RuntimeError("gradbot is not installed — `pip install gradbot`")
     code = (spec.language or "en").lower()
-    name = spec.agent_name or agent_name_for_language(code)
     voice_id = voice_id_override or _VOICE_ID.get(code, _VOICE_ID["en"])
     lang = getattr(gradbot.Lang, _LANG_NAME.get(code, "En"))
     mode = (spec.mode or "business").lower()
@@ -2028,9 +2029,7 @@ async def calls_live() -> dict:
     return {"ok": True, "count": len(calls), "calls": calls}
 
 
-import re as _re
-
-_ROOM_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
+_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _safe_room(room: str) -> str:
@@ -2387,8 +2386,8 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     # Open WAV writers under the call's recording dir. We record at 8 kHz to
     # match what's actually flowing on the wire (post-resample on the agent
     # side, pre-resample on the caller side).
-    state.wav_caller = _open_wav(state.rec_dir / f"sip_caller.wav", sample_rate=TWILIO_ULAW_RATE)
-    state.wav_agent = _open_wav(state.rec_dir / f"tts_direct.wav", sample_rate=TWILIO_ULAW_RATE)
+    state.wav_caller = _open_wav(state.rec_dir / "sip_caller.wav", sample_rate=TWILIO_ULAW_RATE)
+    state.wav_agent = _open_wav(state.rec_dir / "tts_direct.wav", sample_rate=TWILIO_ULAW_RATE)
 
     # Resample state — preserved across chunks for continuity.
     agent_resample_state = None  # 48k → 8k for outbound

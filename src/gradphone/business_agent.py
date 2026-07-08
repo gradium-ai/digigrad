@@ -308,7 +308,7 @@ def build_business_prompt(spec: BusinessCallSpec, *, opener_already_spoken: bool
         + f"{lang} (e.g. "
         + _ex(code, en="'Sorry, I'll continue in English.'", fr="'Pardon, je continue en français.'", pt="'Desculpe, continuo em português.'")
         + ") and immediately move forward — do NOT restart the conversation.\n"
-        f"- Only one self-introduction per fresh person. If transferred to a new voice, you may briefly re-identify (e.g. "
+        "- Only one self-introduction per fresh person. If transferred to a new voice, you may briefly re-identify (e.g. "
         + _ex(code, en=f"'Hello, my name is {name}.'", fr=f"'Bonjour, je m'appelle {name}.'", pt=f"'Olá, chamo-me {name}.'")
         + ") — no apology for bothering them, no full task restatement — then continue from where you left off.\n"
         "\n"
