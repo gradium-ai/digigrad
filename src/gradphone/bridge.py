@@ -734,6 +734,8 @@ def _timeline_event(state: _CallState, name: str, **extra: object) -> None:
 _PENDING: dict[str, _CallState] = {}
 _ACTIVE: dict[str, _CallState] = {}
 _PENDING_LOCK = asyncio.Lock()
+# Strong refs to per-call max-duration watchdogs (asyncio holds tasks weakly).
+_WATCHDOG_TASKS: set[asyncio.Task] = set()
 
 # Concurrency cap on simultaneous gradbot sessions. Gradium STT enforces
 # a per-account session limit; without a bridge-side gate, calls 4+
@@ -1930,6 +1932,7 @@ async def twilio_status(request: fastapi.Request):
                 twilio_call_status=call_status,
                 answered_by=answered_by,
                 duration_seconds=float(duration or 0.0),
+                source="twilio",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("record_call_end failed for room=%s: %s", room, e)
@@ -2913,9 +2916,10 @@ async def twilio_stream(websocket: fastapi.WebSocket):
         await _emit_completion(state)
         # Extract durable memories + push a Telegram summary. Best-effort.
         await _post_call_followups(state)
-        # Persist the WS-side outcome into the calls table. Only writes if
-        # the row is still 'pending', so a Twilio-side terminal status
-        # that fired first wins.
+        # Persist the WS-side outcome into the calls table. source="stream"
+        # lets the agent's real result overwrite the 'unclear' placeholder
+        # Twilio's faster completed-callback may have written, while genuine
+        # busy/no-answer outcomes (no stream, no teardown) stay untouched.
         try:
             br = state.business_result or {}
             duration = max(0.0, time.time() - state.started_at)
@@ -2925,6 +2929,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 answer=br.get("answer") or "",
                 confidence=br.get("confidence") or "",
                 duration_seconds=duration,
+                source="stream",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("record_call_end failed for room=%s: %s", state.room_name, e)
@@ -3161,9 +3166,13 @@ async def dispatch_gradbot_call(
 
     # Max-duration watchdog. gradbot has no Twilio-side cap; without this a
     # runaway call (e.g. the model gets stuck in a loop) racks up minutes.
+    # Keep a strong reference: asyncio only weakly holds tasks, and a GC'd
+    # watchdog would silently disable the hard hangup limit.
     max_seconds = int(os.environ.get("MAX_CALL_DURATION_SECONDS", "600"))
     if max_seconds > 0 and state.twilio_call_sid:
-        asyncio.create_task(_call_watchdog(state.twilio_call_sid, room_name, max_seconds, twilio))
+        wd = asyncio.create_task(_call_watchdog(state.twilio_call_sid, room_name, max_seconds, twilio))
+        _WATCHDOG_TASKS.add(wd)
+        wd.add_done_callback(_WATCHDOG_TASKS.discard)
 
     return room_name
 

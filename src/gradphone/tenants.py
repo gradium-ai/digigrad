@@ -129,17 +129,39 @@ async def record_call_end(
     twilio_call_status: str = "",
     answered_by: str = "",
     duration_seconds: float = 0.0,
+    source: str = "stream",
 ) -> None:
-    """Mark a call as ended. Only writes if the row is still ``pending`` —
-    keeps the first-finisher's outcome (the WS-side business_result usually
-    wins over the Twilio-side terminal status, because it has more info)."""
-    await db.execute(
-        "UPDATE calls SET ended_at = :now, duration_seconds = :dur, status = :status, "
-        "answer = :answer, confidence = :conf, twilio_call_status = :tcs, answered_by = :ab "
-        "WHERE room = :room AND status = 'pending'",
-        now=_now(), dur=duration_seconds, status=status, answer=answer,
-        conf=confidence, tcs=twilio_call_status, ab=answered_by, room=room,
-    )
+    """Mark a call as ended.
+
+    Two writers race here: Twilio's terminal status callback (fast, but on a
+    connected call it only knows "completed" → a placeholder ``unclear``) and
+    the stream teardown (slow — it runs memory extraction first — but carries
+    the agent's real result). Policy:
+
+    - ``source="twilio"``: claim the row only while still ``pending``.
+      Authoritative for calls that never connected (busy/no-answer/failed).
+    - ``source="stream"``: additionally overwrite an ``unclear`` placeholder
+      left by the Twilio callback, preserving its twilio_call_status /
+      answered_by metadata (the stream side doesn't know them).
+    """
+    if source == "stream":
+        await db.execute(
+            "UPDATE calls SET ended_at = :now, duration_seconds = :dur, status = :status, "
+            "answer = :answer, confidence = :conf, "
+            "twilio_call_status = COALESCE(NULLIF(:tcs, ''), twilio_call_status), "
+            "answered_by = COALESCE(NULLIF(:ab, ''), answered_by) "
+            "WHERE room = :room AND status IN ('pending', 'unclear')",
+            now=_now(), dur=duration_seconds, status=status, answer=answer,
+            conf=confidence, tcs=twilio_call_status, ab=answered_by, room=room,
+        )
+    else:
+        await db.execute(
+            "UPDATE calls SET ended_at = :now, duration_seconds = :dur, status = :status, "
+            "answer = :answer, confidence = :conf, twilio_call_status = :tcs, answered_by = :ab "
+            "WHERE room = :room AND status = 'pending'",
+            now=_now(), dur=duration_seconds, status=status, answer=answer,
+            conf=confidence, tcs=twilio_call_status, ab=answered_by, room=room,
+        )
 
 
 async def get_call(room: str) -> Optional[dict]:
