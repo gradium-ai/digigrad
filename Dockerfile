@@ -17,10 +17,11 @@ WORKDIR /app
 
 # Install deps first for layer caching. Editable install so the running code
 # reads templates/ + static/ straight from the copied source (no wheel-data
-# packaging to worry about).
-COPY pyproject.toml ./
+# packaging to worry about). constraints.txt pins every dependency to the
+# exact versions the test suite ran against — deploys don't float.
+COPY pyproject.toml constraints.txt ./
 COPY src ./src
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -c constraints.txt -e .
 
 COPY start.sh ./
 RUN chmod +x ./start.sh
