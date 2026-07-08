@@ -54,13 +54,16 @@ async function openRoomResult(room) {
 window.openRoomResult = openRoomResult;
 
 // ─── Latency breakdown ───────────────────────────────────
-// The cascade stages, in speaking order. STT + TTS are Gradium models;
-// LLM is the configured text model; tool is bridge-measured I/O.
+// What the bridge can measure per turn from gradbot's event stream. STT is
+// Gradium's recognizer (shown when endpoint timing is available); think is
+// transcript→first audio (the silence the caller hears); tool is bridge I/O.
+// gradbot interleaves TTS audio with the model tokens, so TTS isn't separable
+// at this boundary — the Telegram voice-note footer shows the full STT/LLM/TTS
+// split instead.
 const LAT_STAGES = [
-  { key: "stt",  label: "STT",  cls: "gradium" },
-  { key: "llm",  label: "LLM",  cls: "model" },
-  { key: "tool", label: "Tool", cls: "tool" },
-  { key: "tts",  label: "TTS",  cls: "gradium" },
+  { key: "stt",  label: "STT",   cls: "gradium" },
+  { key: "tool", label: "Tool",  cls: "tool" },
+  { key: "llm",  label: "Think", cls: "model" },
 ];
 
 function fmtMs(v) {
@@ -87,15 +90,14 @@ function latencyHtml(latency) {
   ).join("");
   const respMed = med("response");
 
+  // Only show turns that actually produced a response (skip stray/empty ones).
   const rows = latency.turns
-    .filter((t) => t.turn >= 0)
+    .filter((t) => t.response_ms != null)
     .map((t) => `
       <tr>
         <td>${t.turn}</td>
         <td>${fmtMs(t.stt_ms)}</td>
-        <td>${fmtMs(t.llm_ms)}</td>
         <td>${fmtMs(t.tool_ms)}${toolNames(t.tools)}</td>
-        <td>${fmtMs(t.tts_ms)}</td>
         <td class="lat-total">${fmtMs(t.response_ms)}</td>
       </tr>`).join("");
 
@@ -107,12 +109,13 @@ function latencyHtml(latency) {
     <div class="lat-bar">${bar}</div>
     <div class="lat-legend">${legend}</div>
     <table class="lat-table">
-      <thead><tr><th>Turn</th><th>STT</th><th>LLM</th><th>Tool</th><th>TTS</th><th>Response</th></tr></thead>
+      <thead><tr><th>Turn</th><th>STT</th><th>Tool</th><th>Response</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>
     <div class="lat-caption">
-      Measured at the bridge from gradbot event arrival times. STT + TTS are
-      Gradium; LLM is the configured text model; tool is dispatch→result.
+      Measured at the bridge from gradbot event arrival times. Response is
+      transcript→first audio — the silence the caller hears. STT is Gradium's
+      recognizer; tool is dispatch→result.
     </div>`;
 }
 
