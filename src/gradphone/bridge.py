@@ -533,6 +533,13 @@ def _gradium_tool_defs() -> list[Any]:
                 "required": ["query"],
             }),
         ),
+    ] + (
+        # Live web search for Gradium/voice-AI questions the baked KB can't
+        # answer (recent news, comparisons). Only when a key is configured;
+        # the existing handler already caps it at 8s with spoken fallbacks.
+        [_web_search_tool_def()]
+        if os.environ.get("LINKUP_API_KEY", "").strip() else []
+    ) + [
         _hang_up_tool_def(),
     ]
 
@@ -736,6 +743,36 @@ _ACTIVE: dict[str, _CallState] = {}
 _PENDING_LOCK = asyncio.Lock()
 # Strong refs to per-call max-duration watchdogs (asyncio holds tasks weakly).
 _WATCHDOG_TASKS: set[asyncio.Task] = set()
+
+# ── Public-line abuse guards ─────────────────────────────────────────────
+# The concierge number is shared openly, so unknown callers get a per-number
+# hourly call cap and a shorter per-call duration cap. Both are cost guards:
+# every connected minute burns Gradium STT/TTS + LLM. In-memory is fine —
+# single instance, and a restart resetting counters is harmless.
+_CALLER_HISTORY: dict[str, deque] = {}
+_GRADIUM_CALLS_PER_HOUR = int(os.environ.get("GRADIUM_CALLS_PER_HOUR", "6"))
+_GRADIUM_MAX_CALL_SECONDS = _env_float("GRADIUM_MAX_CALL_SECONDS", 300.0)
+_GRADIUM_TIME_UP_PHRASE = os.environ.get(
+    "GRADIUM_TIME_UP_PHRASE",
+    "Thanks so much for trying Gradium — this demo call has reached its time "
+    "limit. Find everything else at gradium dot A I. Goodbye!",
+)
+
+
+def _caller_over_rate_limit(caller: str) -> bool:
+    """True if this caller has exceeded the hourly cap for concierge calls.
+    Unknown/withheld caller IDs share one bucket. 0 disables the limit."""
+    if _GRADIUM_CALLS_PER_HOUR <= 0:
+        return False
+    key = caller or "anonymous"
+    now = time.monotonic()
+    hist = _CALLER_HISTORY.setdefault(key, deque(maxlen=max(_GRADIUM_CALLS_PER_HOUR * 2, 12)))
+    while hist and now - hist[0] > 3600.0:
+        hist.popleft()
+    if len(hist) >= _GRADIUM_CALLS_PER_HOUR:
+        return True
+    hist.append(now)
+    return False
 
 # Concurrency cap on simultaneous gradbot sessions. Gradium STT enforces
 # a per-account session limit; without a bridge-side gate, calls 4+
@@ -2261,6 +2298,23 @@ async def twilio_voice(request: fastapi.Request):
                 '<Hangup/></Response>',
                 media_type="application/xml",
             )
+        # Public-line rate limit: strangers get N concierge calls per hour.
+        # Registered owners are exempt (it's their own assistant).
+        caller = params.get("From", "")
+        is_owner = False
+        try:
+            is_owner = bool(await tenants.get_tenant_by_phone(caller))
+        except Exception:  # noqa: BLE001
+            pass
+        if not is_owner and _caller_over_rate_limit(caller):
+            log.info("inbound call rate-limited from %s", caller)
+            return PlainTextResponse(
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<Response><Say>Thanks for your enthusiasm for Gradium! You've "
+                "reached the demo limit for this hour — please call back later "
+                "or visit gradium dot A I. Goodbye.</Say><Hangup/></Response>",
+                media_type="application/xml",
+            )
         room = await _register_inbound_call(params)
 
     # Voicemail branch — if Twilio's machine_detection caught a non-human
@@ -2583,6 +2637,35 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 await _send_agent_ulaw(ulaw, log_type="silence_recovery")
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _public_call_time_limit() -> None:
+        """Cap concierge (public-line) calls: at the limit, say a warm goodbye
+        and end the call. Cost guard — the number is shared openly, and every
+        connected minute burns Gradium + LLM credits."""
+        try:
+            await asyncio.sleep(_GRADIUM_MAX_CALL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        if stop_event.is_set():
+            return
+        log.info("call %s | public-line time limit reached — wrapping up", state.room_name)
+        _timeline_event(state, "time_limit_reached")
+        ulaw = await _render_text_ulaw(call_voice_id, _GRADIUM_TIME_UP_PHRASE)
+        if ulaw and not stop_event.is_set():
+            try:
+                await _send_agent_ulaw(ulaw, log_type="time_limit_goodbye")
+                # Twilio buffers; wait roughly the playback duration so the
+                # goodbye is heard before we tear the call down.
+                await asyncio.sleep(min(len(ulaw) / TWILIO_ULAW_RATE + 0.5, 15.0))
+            except Exception:  # noqa: BLE001
+                pass
+        stop_event.set()
+        await _safe_close(websocket)
+
+    if (state.spec.mode or "").lower() == "gradium" and _GRADIUM_MAX_CALL_SECONDS > 0:
+        _tl = asyncio.create_task(_public_call_time_limit())
+        silence_watchdogs.add(_tl)  # cancelled in the teardown alongside the others
+        _tl.add_done_callback(silence_watchdogs.discard)
 
     await _play_business_opener()
 

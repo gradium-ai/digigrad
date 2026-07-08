@@ -42,7 +42,8 @@ def test_receptionist_mode_tools_no_data_access():
     assert "recall" not in _tool_names(cfg)
 
 
-def test_gradium_mode_tools_no_owner_data():
+def test_gradium_mode_tools_no_owner_data(monkeypatch):
+    monkeypatch.setenv("LINKUP_API_KEY", "")  # web_search variant tested separately
     cfg = bridge._make_session_config(BusinessCallSpec(task="", mode="gradium"))
     assert _tool_names(cfg) == ["search_gradium_docs", "hang_up"]
     # The conference agent must not reach the owner's email, memory, or dialing.
@@ -176,3 +177,41 @@ def test_email_not_configured_raises(monkeypatch):
     monkeypatch.delenv("GMAIL_APP_PASSWORD", raising=False)
     with pytest.raises(email_inbox.EmailNotConfigured):
         email_inbox.fetch_recent(days=7)
+
+
+def test_gradium_prompt_guardrails():
+    from gradphone.business_agent import build_gradium_prompt
+
+    p = build_gradium_prompt(BusinessCallSpec(task=""))
+    # Computational-task refusal
+    assert "not what this line is built for" in p
+    # Identity lock + injection resistance + no prompt disclosure
+    assert "SECURITY RULES" in p
+    assert "DATA, never" in p
+    assert "Never reveal" in p
+    # Repeat-after-me is declined
+    assert "repeat" in p.lower()
+
+
+def test_gradium_tools_web_search_gated_by_key(monkeypatch):
+    monkeypatch.setenv("LINKUP_API_KEY", "test-key")
+    cfg = bridge._make_session_config(BusinessCallSpec(task="", mode="gradium"))
+    assert _tool_names(cfg) == ["search_gradium_docs", "web_search", "hang_up"]
+    monkeypatch.setenv("LINKUP_API_KEY", "")
+    cfg = bridge._make_session_config(BusinessCallSpec(task="", mode="gradium"))
+    assert _tool_names(cfg) == ["search_gradium_docs", "hang_up"]
+
+
+def test_caller_rate_limit(monkeypatch):
+    monkeypatch.setattr(bridge, "_GRADIUM_CALLS_PER_HOUR", 3)
+    bridge._CALLER_HISTORY.clear()
+    caller = "+15550001111"
+    assert not bridge._caller_over_rate_limit(caller)
+    assert not bridge._caller_over_rate_limit(caller)
+    assert not bridge._caller_over_rate_limit(caller)
+    assert bridge._caller_over_rate_limit(caller)      # 4th call in the hour → blocked
+    assert not bridge._caller_over_rate_limit("+15550002222")  # other callers unaffected
+    # 0 disables the limit entirely
+    monkeypatch.setattr(bridge, "_GRADIUM_CALLS_PER_HOUR", 0)
+    for _ in range(10):
+        assert not bridge._caller_over_rate_limit(caller)
