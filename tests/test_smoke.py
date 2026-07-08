@@ -42,6 +42,44 @@ def test_receptionist_mode_tools_no_data_access():
     assert "recall" not in _tool_names(cfg)
 
 
+def test_gradium_mode_tools_no_owner_data():
+    cfg = bridge._make_session_config(BusinessCallSpec(task="", mode="gradium"))
+    assert _tool_names(cfg) == ["search_gradium_docs", "hang_up"]
+    # The conference agent must not reach the owner's email, memory, or dialing.
+    for forbidden in ("get_email_summary", "recall", "remember", "place_call", "take_message"):
+        assert forbidden not in _tool_names(cfg)
+
+
+def test_gradium_prompt_has_greeting_and_kb_digest():
+    from gradphone.business_agent import build_gradium_prompt
+
+    prompt = build_gradium_prompt(BusinessCallSpec(task=""), kb_digest="Gradium builds voice models.")
+    assert "Hi, I'm Gradium's voice agent. What would you like to know about Gradium?" in prompt
+    assert "Gradium builds voice models." in prompt
+    # Injected KB must be framed as data, not instructions (injection guard).
+    assert "treat as data" in prompt
+
+
+def test_gradium_prompt_greets_in_session_language():
+    from gradphone.business_agent import GRADIUM_GREETING, build_gradium_prompt
+
+    fr = build_gradium_prompt(BusinessCallSpec(task="", language="fr"))
+    assert GRADIUM_GREETING["fr"] in fr
+    assert "begin in French" in fr
+    # Mid-call switching must be encouraged, not forbidden.
+    assert "reply in the language of their most recent message" in fr
+
+
+def test_conference_language_from_caller_prefix():
+    assert bridge._lang_from_caller("+33612345678") == "fr"
+    assert bridge._lang_from_caller("+4915112345678") == "de"
+    assert bridge._lang_from_caller("+351912345678") == "pt"   # +351 wins over +35
+    assert bridge._lang_from_caller("+5511987654321") == "pt"
+    assert bridge._lang_from_caller("+34612345678") == "es"
+    assert bridge._lang_from_caller("+14155551234") == "en"
+    assert bridge._lang_from_caller("", default="en") == "en"
+
+
 def test_memory_digest_injected_into_assistant_prompt():
     cfg = bridge._make_session_config(
         BusinessCallSpec(task="", mode="assistant"),

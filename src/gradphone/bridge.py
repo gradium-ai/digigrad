@@ -47,8 +47,10 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,13 +63,16 @@ try:  # pragma: no cover
     HAS_GRADBOT = True
 except ImportError:
     gradbot = None  # type: ignore[assignment]
-    sanitize = lambda x: x  # type: ignore[assignment]
+
+    def sanitize(x):  # type: ignore[misc] - passthrough when gradbot absent
+        return x
     HAS_GRADBOT = False
 
 import fastapi
 from fastapi.responses import PlainTextResponse
 
 from . import email_inbox
+from . import kb
 from . import memory as memory_mod
 from . import db as db_mod
 from . import places
@@ -75,9 +80,9 @@ from . import tenants
 from . import websearch
 from .business_agent import (
     BusinessCallSpec,
-    agent_name_for_language,
     build_assistant_prompt,
     build_business_prompt,
+    build_gradium_prompt,
     build_opener_text,
     build_receptionist_prompt,
     contains_personal_detail,
@@ -124,7 +129,31 @@ _VOICE_ID = {
 }
 
 # Per-language Lang enum value name in gradbot. Resolved lazily.
-_LANG_NAME = {"en": "En", "fr": "Fr", "pt": "Pt"}
+_LANG_NAME = {"en": "En", "fr": "Fr", "pt": "Pt", "de": "De", "es": "Es"}
+
+# Voice for the conference "gradium" mode (override with GRADIUM_VOICE_ID or
+# INBOUND_VOICE_ID). Chosen by the operator as the brand voice for the booth.
+_GRADIUM_DEFAULT_VOICE_ID = "jBULVCDhf05tOJN5"
+
+# Conference language by caller country prefix. A gradbot session pins STT/TTS
+# to ONE language, so we pick per caller: a +33 number gets the French agent,
+# +49 German, +34 Spanish, +351/+55 Portuguese — everyone else English.
+# Longest-prefix match; extend for the venue as needed.
+_LANG_BY_PREFIX = {
+    "+33": "fr",
+    "+49": "de", "+43": "de", "+41": "de",
+    "+34": "es", "+52": "es", "+54": "es", "+56": "es", "+57": "es",
+    "+351": "pt", "+55": "pt",
+}
+
+
+def _lang_from_caller(caller: str, default: str = "en") -> str:
+    num = (caller or "").strip()
+    best = ""
+    for prefix in _LANG_BY_PREFIX:
+        if num.startswith(prefix) and len(prefix) > len(best):
+            best = prefix
+    return _LANG_BY_PREFIX[best] if best else default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -146,7 +175,36 @@ def _env_flag(name: str, default: bool = False) -> bool:
 # the filler block in twilio_stream. Off unless ENABLE_FILLERS is set.
 _FILLER_PHRASE = os.environ.get("FILLER_PHRASE", "Mm, let me see.")
 _FILLER_DELAY_S = _env_float("FILLER_DELAY_S", 0.7)
+# Post-tool silence recovery: if the model goes quiet after a tool returns,
+# speak this after _POST_TOOL_SILENCE_S so the line never dead-airs.
+_POST_TOOL_SILENCE_S = _env_float("POST_TOOL_SILENCE_S", 5.0)
+_POST_TOOL_RECOVERY_PHRASE = os.environ.get(
+    "POST_TOOL_RECOVERY_PHRASE", "Sorry, still pulling that up — one moment."
+)
+# Max seconds to keep playing agent audio after hang_up so the closing line
+# finishes instead of being clipped mid-word.
+_FAREWELL_DRAIN_S = _env_float("FAREWELL_DRAIN_S", 3.0)
 _TTS_ULAW_CACHE: dict[tuple[str, str], bytes] = {}
+# Voice IDs proven renderable this process, so we validate a clone at most once.
+_VALID_VOICES: set[str] = set()
+
+
+async def _voice_is_renderable(voice_id: str) -> bool:
+    """True if Gradium can synthesize with this voice UID right now.
+
+    A clone that was deleted server-side (or an account/key rotation) leaves a
+    stale UID in the tenant row; using it makes the live TTS stream fail and
+    the call drop instantly. A cheap one-word render (cached) catches that
+    before we dial, so we can fall back to a default voice instead.
+    """
+    if not voice_id:
+        return True  # empty → caller falls back to the language default anyway
+    if voice_id in _VALID_VOICES:
+        return True
+    ok = bool(await _render_text_ulaw(voice_id, "Hello."))
+    if ok:
+        _VALID_VOICES.add(voice_id)
+    return ok
 
 
 async def _render_text_ulaw(voice_id: str, text: str) -> bytes | None:
@@ -448,6 +506,37 @@ def _receptionist_tool_defs() -> list[Any]:
     ]
 
 
+def _gradium_tool_defs() -> list[Any]:
+    """Tools for the inbound conference agent: search the Gradium KB + hang up.
+    No owner data access — the caller is a stranger at a conference."""
+    if not HAS_GRADBOT:
+        return []
+    return [
+        gradbot.ToolDef(
+            name="search_gradium_docs",
+            description=(
+                "Look up specific facts about Gradium — models, benchmarks, "
+                "pricing tiers, the team, customers, or a particular blog post — "
+                "from Gradium's own website and blog. Call this before stating "
+                "any specific number, price, benchmark, or claim. Pass a short "
+                "natural-language query (e.g. 'time to first audio latency', "
+                "'pricing plans', 'voice cloning')."
+            ),
+            parameters_json=json.dumps({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look up, in a few keywords.",
+                    },
+                },
+                "required": ["query"],
+            }),
+        ),
+        _hang_up_tool_def(),
+    ]
+
+
 def _tool_defs() -> list[Any]:
     if not HAS_GRADBOT:
         return []
@@ -645,6 +734,8 @@ def _timeline_event(state: _CallState, name: str, **extra: object) -> None:
 _PENDING: dict[str, _CallState] = {}
 _ACTIVE: dict[str, _CallState] = {}
 _PENDING_LOCK = asyncio.Lock()
+# Strong refs to per-call max-duration watchdogs (asyncio holds tasks weakly).
+_WATCHDOG_TASKS: set[asyncio.Task] = set()
 
 # Concurrency cap on simultaneous gradbot sessions. Gradium STT enforces
 # a per-account session limit; without a bridge-side gate, calls 4+
@@ -669,7 +760,6 @@ def _make_session_config(
     if not HAS_GRADBOT:
         raise RuntimeError("gradbot is not installed — `pip install gradbot`")
     code = (spec.language or "en").lower()
-    name = spec.agent_name or agent_name_for_language(code)
     voice_id = voice_id_override or _VOICE_ID.get(code, _VOICE_ID["en"])
     lang = getattr(gradbot.Lang, _LANG_NAME.get(code, "En"))
     mode = (spec.mode or "business").lower()
@@ -680,6 +770,9 @@ def _make_session_config(
         owner = os.environ.get("OPERATOR_NAME", "").strip()
         instructions = build_receptionist_prompt(spec, owner_name=owner)
         tools = _receptionist_tool_defs()
+    elif mode == "gradium":
+        instructions = build_gradium_prompt(spec, kb_digest=kb.DIGEST)
+        tools = _gradium_tool_defs()
     else:
         instructions = build_business_prompt(spec, opener_already_spoken=True)
         tools = _tool_defs()
@@ -1009,6 +1102,25 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         _timeline_event(state, "end_business_call", reason=reason[:120])
         await _append_transcript(state, "BUSINESS-END", reason or "agent ended call")
         await handle.send_json({"success": True})
+        return
+
+    if name == "search_gradium_docs":
+        query = (args.get("query") or "").strip()
+        if not query:
+            await handle.send_error("Refused: empty query — ask what to look up about Gradium.")
+            return
+        log.info("call %s | search_gradium_docs query=%r", state.room_name, query)
+        # Local FTS over the baked KB — no network, effectively instant.
+        results = kb.search(query, k=4)
+        _timeline_event(state, "search_gradium_docs", count=len(results), query=query[:80])
+        if not results:
+            await handle.send_json({
+                "results": [],
+                "note": "Nothing specific found — answer from general knowledge or "
+                        "say you're not sure and point them to gradium.ai.",
+            })
+            return
+        await handle.send_json({"results": results})
         return
 
     if name == "remember":
@@ -1479,6 +1591,88 @@ async def healthz() -> dict:
     }
 
 
+async def _check(name: str, coro) -> tuple[str, dict]:
+    """Run one preflight check with a hard timeout; never raises."""
+    t0 = time.monotonic()
+    try:
+        detail = await asyncio.wait_for(coro, timeout=10.0)
+        return name, {"ok": True, "ms": (time.monotonic() - t0) * 1000, "detail": detail}
+    except Exception as e:  # noqa: BLE001
+        return name, {"ok": False, "ms": (time.monotonic() - t0) * 1000, "error": str(e)[:160]}
+
+
+@app.get("/readyz", dependencies=[fastapi.Depends(_require_bearer)])
+async def readyz() -> dict:
+    """Deep preflight for the pre-demo checklist: exercise every dependency a
+    live call needs and report per-check pass/fail + latency. Powers the bot's
+    /checkup command. Bearer-protected — it makes real upstream calls."""
+
+    async def _gradium() -> str:
+        ulaw = await _render_text_ulaw(_VOICE_ID["en"], "Ready.")
+        if not ulaw:
+            raise RuntimeError("TTS render returned no audio")
+        return f"{len(ulaw)} bytes"
+
+    async def _llm() -> str:
+        import aiohttp
+        base = os.environ.get("LLM_BASE_URL", "").strip().rstrip("/")
+        model = os.environ.get("LLM_MODEL", "").strip()
+        key = (os.environ.get("OPENAI_API_KEY", "").strip()
+               or os.environ.get("GRADIUM_API_KEY", "").strip())
+        if not base or not model:
+            raise RuntimeError("LLM_BASE_URL / LLM_MODEL not set")
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                f"{base}/chat/completions",
+                headers={"Authorization": f"Bearer {key}"},
+                json={"model": model, "max_tokens": 1,
+                      "messages": [{"role": "user", "content": "ping"}]},
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}: {(await r.text())[:120]}")
+        return model
+
+    async def _twilio() -> str:
+        cfg = get_cfg()  # raises if Twilio creds unset
+        import aiohttp
+        sid = cfg.twilio_account_sid
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://api.twilio.com/2010-04-01/Accounts/{sid}.json",
+                auth=aiohttp.BasicAuth(sid, cfg.twilio_auth_token),
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status}")
+        return sid[:10] + "…"
+
+    async def _public_url() -> str:
+        url = os.environ.get("PUBLIC_HTTP_URL", "").strip().rstrip("/")
+        if not url:
+            raise RuntimeError("PUBLIC_HTTP_URL not set")
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{url}/healthz", timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"outside-in HTTP {r.status}")
+        return url
+
+    async def _database() -> str:
+        await db_mod.fetch_one("SELECT 1 AS x")
+        return db_mod.url_for_log()
+
+    results = await asyncio.gather(
+        _check("gradium_tts", _gradium()),
+        _check("llm", _llm()),
+        _check("twilio", _twilio()),
+        _check("public_url", _public_url()),
+        _check("database", _database()),
+    )
+    checks = dict(results)
+    return {"ok": all(c["ok"] for c in checks.values()), "checks": checks}
+
+
 def _count_outbound_sockets() -> dict:
     """Count outbound TCP sockets owned by THIS Python process, grouped
     by remote host. Used by /diagnostics so the dashboard can show how
@@ -1738,6 +1932,7 @@ async def twilio_status(request: fastapi.Request):
                 twilio_call_status=call_status,
                 answered_by=answered_by,
                 duration_seconds=float(duration or 0.0),
+                source="twilio",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("record_call_end failed for room=%s: %s", room, e)
@@ -1837,9 +2032,7 @@ async def calls_live() -> dict:
     return {"ok": True, "count": len(calls), "calls": calls}
 
 
-import re as _re
-
-_ROOM_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
+_ROOM_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 def _safe_room(room: str) -> str:
@@ -1949,6 +2142,24 @@ async def register(payload: dict) -> dict:
     return {"ok": True, "tenant_id": tenant_id}
 
 
+@app.post("/tenants/{tenant_id}/phone", dependencies=[fastapi.Depends(_require_bearer)])
+async def set_tenant_phone(tenant_id: int, payload: dict) -> dict:
+    """Admin: set (or clear, with "") the tenant's registered phone number.
+
+    Caller-ID routing treats this number as the tenant's identity, so it
+    decides who reaches their own assistant vs. the receptionist/concierge.
+    Normally set by sharing a contact in Telegram; this endpoint covers
+    hosted deployments where the DB isn't otherwise reachable.
+    """
+    row = await tenants.get_tenant_by_id(tenant_id)
+    if not row:
+        return {"ok": False, "error": "no such tenant"}
+    phone = str(payload.get("phone") or "").strip()
+    await tenants.set_tenant_phone(tenant_id, phone)
+    updated = await tenants.get_tenant_by_id(tenant_id)
+    return {"ok": True, "tenant_id": tenant_id, "phone": (updated or {}).get("phone")}
+
+
 async def _register_inbound_call(params: dict) -> str:
     """Build receptionist call state for an inbound call and register it in
     _PENDING. Returns the generated room name to embed in the TwiML stream.
@@ -1975,10 +2186,32 @@ async def _register_inbound_call(params: dict) -> str:
     except Exception as exc:  # noqa: BLE001
         log.warning("caller-id lookup failed: %s", exc)
 
+    conference = _env_flag("GRADIUM_CONFERENCE_MODE")
     if tenant:
+        # The registered owner always reaches their own assistant (their voice
+        # + memory + tools), even in conference mode.
         mode = "assistant"
         tenant_id = int(tenant["id"])
         voice_id_override = tenant.get("voice_id") or os.environ.get("INBOUND_VOICE_ID", "").strip() or None
+        # A dead clone UID would crash the live TTS stream; fall back silently
+        # to the default voice for inbound (the owner already gets a Telegram
+        # warning on the outbound /callme path).
+        if voice_id_override and not await _voice_is_renderable(voice_id_override):
+            log.warning("inbound: tenant %s voice %s not renderable — default voice", tenant_id, voice_id_override)
+            voice_id_override = os.environ.get("INBOUND_VOICE_ID", "").strip() or None
+    elif conference:
+        # Everyone else at the conference reaches the Gradium voice agent,
+        # speaking in the dedicated conference voice (never the owner's clone).
+        # Session language follows the caller's country code so a French
+        # number gets a French-listening agent (STT is pinned per session).
+        mode = "gradium"
+        tenant_id = None
+        lang = _lang_from_caller(caller, default=lang)
+        voice_id_override = (
+            os.environ.get("GRADIUM_VOICE_ID", "").strip()
+            or os.environ.get("INBOUND_VOICE_ID", "").strip()
+            or _GRADIUM_DEFAULT_VOICE_ID
+        )
     else:
         mode = "receptionist"
         tenant_id = None
@@ -2156,8 +2389,8 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     # Open WAV writers under the call's recording dir. We record at 8 kHz to
     # match what's actually flowing on the wire (post-resample on the agent
     # side, pre-resample on the caller side).
-    state.wav_caller = _open_wav(state.rec_dir / f"sip_caller.wav", sample_rate=TWILIO_ULAW_RATE)
-    state.wav_agent = _open_wav(state.rec_dir / f"tts_direct.wav", sample_rate=TWILIO_ULAW_RATE)
+    state.wav_caller = _open_wav(state.rec_dir / "sip_caller.wav", sample_rate=TWILIO_ULAW_RATE)
+    state.wav_agent = _open_wav(state.rec_dir / "tts_direct.wav", sample_rate=TWILIO_ULAW_RATE)
 
     # Resample state — preserved across chunks for continuity.
     agent_resample_state = None  # 48k → 8k for outbound
@@ -2232,6 +2465,15 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     awaiting_response = {"v": False}      # caller finished; agent hasn't replied yet
     filler_used_this_turn = {"v": False}  # at most one filler per think-gap
     filler_tasks: set[asyncio.Task] = set()
+    # Deaf-window buffer: caller audio that arrives during the opener guard is
+    # HELD here and flushed to STT once the guard lifts, instead of being
+    # dropped — so a caller who starts talking over the greeting isn't ignored.
+    # Bounded (~8s at 20ms/frame) so it can never grow without limit.
+    opener_buf: deque[bytes] = deque(maxlen=400)
+    # Monotonic time of the last agent audio frame — the post-tool silence
+    # watchdog uses it to detect "tool returned but the model never spoke".
+    last_agent_audio = {"t": 0.0}
+    silence_watchdogs: set[asyncio.Task] = set()
     # Barge-in guard: ignore interruptions within this many seconds of an agent
     # turn starting, so brief noise/echo right as the clone begins speaking
     # doesn't twitchily cut it off. Raise it if barge-in feels too sensitive,
@@ -2317,6 +2559,30 @@ async def twilio_stream(websocket: fastapi.WebSocket):
             await _send_agent_ulaw(ulaw, log_type="filler")
         except Exception:  # noqa: BLE001
             pass
+
+    async def _post_tool_silence_watchdog(tool_done_at: float) -> None:
+        """Cover the 'tool returned but the model never spoke' dead-air.
+
+        Some models announce a lookup, call the tool, get the result, and then
+        emit nothing — the caller hears silence until they hang up. If no agent
+        audio has arrived within POST_TOOL_SILENCE_S of a tool completing, play
+        a short recovery line in the call voice so the line never goes dead.
+        """
+        try:
+            await asyncio.sleep(_POST_TOOL_SILENCE_S)
+        except asyncio.CancelledError:
+            return
+        if stop_event.is_set() or state.end_requested:
+            return
+        if last_agent_audio["t"] >= tool_done_at:
+            return  # the model spoke after the tool — nothing to cover
+        log.warning("call %s | post-tool silence — playing recovery line", state.room_name)
+        ulaw = await _render_text_ulaw(call_voice_id, _POST_TOOL_RECOVERY_PHRASE)
+        if ulaw and not stop_event.is_set() and last_agent_audio["t"] < tool_done_at:
+            try:
+                await _send_agent_ulaw(ulaw, log_type="silence_recovery")
+            except Exception:  # noqa: BLE001
+                pass
 
     await _play_business_opener()
 
@@ -2415,6 +2681,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                         continue
                     awaiting_response["v"] = False
                     filler_used_this_turn["v"] = False
+                    last_agent_audio["t"] = now
                     if state.first_agent_audio_at is None:
                         state.first_agent_audio_at = now
                     ulaw_8k, agent_resample_state = _resample_ulaw(
@@ -2509,8 +2776,30 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                         post_tool["first_answer_at"] = 0.0
                     task.add_done_callback(_arm_post_tool)
 
-                # If the LLM called end_business_call, stop the consumer too.
+                    # Dead-air guard: once this tool finishes, make sure the
+                    # model actually speaks the result (see watchdog above).
+                    def _arm_silence_watchdog(_t: asyncio.Task) -> None:
+                        wt = asyncio.create_task(_post_tool_silence_watchdog(time.monotonic()))
+                        silence_watchdogs.add(wt)
+                        wt.add_done_callback(silence_watchdogs.discard)
+                    task.add_done_callback(_arm_silence_watchdog)
+
+                # If the LLM asked to end the call, drain any farewell audio
+                # still streaming before tearing down — otherwise the closing
+                # line ("thanks, bye!") gets clipped mid-word on hangup.
                 if state.end_requested:
+                    drain_deadline = time.monotonic() + _FAREWELL_DRAIN_S
+                    while time.monotonic() < drain_deadline:
+                        try:
+                            m = await asyncio.wait_for(output_handle.receive(), timeout=0.4)
+                        except asyncio.TimeoutError:
+                            break  # audio has stopped flowing — farewell done
+                        if m is None or getattr(m, "msg_type", None) != "audio":
+                            continue
+                        ulaw_8k, agent_resample_state = _resample_ulaw(
+                            m.data, GRADBOT_OUTPUT_RATE, TWILIO_ULAW_RATE, agent_resample_state,
+                        )
+                        await _send_agent_ulaw(ulaw_8k)
                     return
         except Exception:  # noqa: BLE001
             log.exception("gradbot consumer error")
@@ -2565,7 +2854,15 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                         agent_turn["start"]
                         and (now_p - agent_turn["start"]) < barge_guard_s
                     )
-                    if not opener_guard and not turn_guard:
+                    if opener_guard:
+                        # Hold, don't drop: buffer caller speech during the
+                        # greeting so it isn't lost if they start early.
+                        opener_buf.append(audio_24k)
+                    elif not turn_guard:
+                        # Guard just lifted — flush anything the caller said
+                        # during the opener, in order, before the live frame.
+                        while opener_buf:
+                            await input_handle.send_audio(opener_buf.popleft())
                         await input_handle.send_audio(audio_24k)
                     if state.wav_caller is not None:
                         try:
@@ -2596,6 +2893,8 @@ async def twilio_stream(websocket: fastapi.WebSocket):
             _GRADBOT_SEMAPHORE.release()
         for t in filler_tasks:
             t.cancel()
+        for t in silence_watchdogs:
+            t.cancel()
         for t in pending_tool_tasks:
             t.cancel()
         if pending_tool_tasks:
@@ -2617,9 +2916,10 @@ async def twilio_stream(websocket: fastapi.WebSocket):
         await _emit_completion(state)
         # Extract durable memories + push a Telegram summary. Best-effort.
         await _post_call_followups(state)
-        # Persist the WS-side outcome into the calls table. Only writes if
-        # the row is still 'pending', so a Twilio-side terminal status
-        # that fired first wins.
+        # Persist the WS-side outcome into the calls table. source="stream"
+        # lets the agent's real result overwrite the 'unclear' placeholder
+        # Twilio's faster completed-callback may have written, while genuine
+        # busy/no-answer outcomes (no stream, no teardown) stay untouched.
         try:
             br = state.business_result or {}
             duration = max(0.0, time.time() - state.started_at)
@@ -2629,6 +2929,7 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                 answer=br.get("answer") or "",
                 confidence=br.get("confidence") or "",
                 duration_seconds=duration,
+                source="stream",
             )
         except Exception as e:  # noqa: BLE001
             log.warning("record_call_end failed for room=%s: %s", state.room_name, e)
@@ -2759,6 +3060,21 @@ async def dispatch_gradbot_call(
     # If the tenant has a cloned voice, use it. Operator calls (tenant_id=None)
     # fall through to the default _VOICE_ID per-language.
     voice_id_override: str | None = (tenant_row or {}).get("voice_id") or None
+    # Validate the clone before dialing: a dead UID would otherwise crash the
+    # live TTS stream and drop the call. Fall back to the default voice and
+    # warn the owner on Telegram so they know to re-clone.
+    if voice_id_override and not await _voice_is_renderable(voice_id_override):
+        log.warning("dispatch: tenant %s voice %s not renderable — falling back to default",
+                    tenant_id, voice_id_override)
+        voice_id_override = None
+        tg = (tenant_row or {}).get("telegram_id")
+        if tg:
+            await _notify_telegram(
+                str(tg),
+                "⚠️ Your voice clone isn't available right now, so this call will "
+                "use a default voice. Send a fresh voice note (after /clear_voice) "
+                "to re-clone.",
+            )
 
     state = _CallState(
         spec=spec,
@@ -2850,9 +3166,13 @@ async def dispatch_gradbot_call(
 
     # Max-duration watchdog. gradbot has no Twilio-side cap; without this a
     # runaway call (e.g. the model gets stuck in a loop) racks up minutes.
+    # Keep a strong reference: asyncio only weakly holds tasks, and a GC'd
+    # watchdog would silently disable the hard hangup limit.
     max_seconds = int(os.environ.get("MAX_CALL_DURATION_SECONDS", "600"))
     if max_seconds > 0 and state.twilio_call_sid:
-        asyncio.create_task(_call_watchdog(state.twilio_call_sid, room_name, max_seconds, twilio))
+        wd = asyncio.create_task(_call_watchdog(state.twilio_call_sid, room_name, max_seconds, twilio))
+        _WATCHDOG_TASKS.add(wd)
+        wd.add_done_callback(_WATCHDOG_TASKS.discard)
 
     return room_name
 

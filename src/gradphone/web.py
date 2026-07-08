@@ -26,7 +26,7 @@ from typing import Optional
 
 from . import db
 import fastapi
-from fastapi import Cookie, Form, Request, status
+from fastapi import Form, Request, status
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,

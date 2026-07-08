@@ -32,6 +32,7 @@ from typing import Optional
 import aiohttp
 from dotenv import load_dotenv
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -52,6 +53,7 @@ from telegram.ext import (
 )
 from telegram import Update as _Update
 
+from . import memory as _memory
 from . import tenants as _tenants_db
 from . import translate as _translate
 from . import voice_chat as _voice_chat
@@ -66,6 +68,9 @@ log = logging.getLogger("gradphone.bot")
 ASK_TO, ASK_TASK, ASK_LANG, CONFIRM = range(4)
 LANGUAGES = ["en", "fr", "pt"]
 MAX_HISTORY_DISPLAYED = 10
+# Stock Gradium voice for the post-clone A/B sample (Arthur, the bridge's en
+# default). Override via env if the account uses different built-ins.
+_AB_DEFAULT_VOICE_ID = os.environ.get("AB_DEFAULT_VOICE_ID", "3jUdJyOi9pgbxBTK")
 
 
 def _bridge_url() -> str:
@@ -123,17 +128,28 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     tenant = await _fetch_tenant(user.id) if user else None
     if tenant:
+        has_voice = bool(tenant.get("voice_id"))
+        lead = (
+            "🎙️ Send me a voice note to talk to your clone, or /translate to hear "
+            "yourself in another language."
+            if has_voice else
+            "🎙️ Send me a 20–30s voice note and I'll clone your voice."
+        )
         await update.message.reply_text(
             f"Welcome back, {tenant['name']}.\n\n"
-            "/call to place a call.\n"
-            "/web for the web dashboard.\n"
-            "/history /status /whoami /cancel"
+            f"{lead}\n\n"
+            "/callme — your clone calls your phone\n"
+            "/translate — hear yourself in another language\n"
+            "/reset — wipe your data · /checkup — system status\n"
+            "/voice /history /status /whoami"
         )
         return
     await update.message.reply_text(
-        "Hi — I'm gradphone, an outbound voice AI agent.\n\n"
-        "Send /register to create your account, then /call to place your "
-        "first call.\n\n"
+        "Hi — I'm gradphone. I can clone your voice, chat and translate in it, "
+        "and even answer your phone.\n\n"
+        "1. Send /register to create your account.\n"
+        "2. Then send me a 20–30 second voice note — I'll clone your voice and "
+        "reply in it.\n\n"
         "/whoami shows your Telegram ID."
     )
 
@@ -628,6 +644,90 @@ async def clear_voice(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Cleared. Future calls use the language default.")
 
 
+async def reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/reset` — wipe everything this tenant has: memories, voice clone,
+    saved phone, and chat history. Confirmation-gated. Ideal between demos."""
+    user = update.effective_user
+    tenant = await _fetch_tenant(user.id) if user else None
+    if not tenant:
+        await update.message.reply_text("Nothing to reset — you're not registered.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑️ Yes, wipe everything", callback_data="reset:yes"),
+        InlineKeyboardButton("Cancel", callback_data="reset:no"),
+    ]])
+    await update.message.reply_text(
+        "This clears your saved facts (memory), your voice clone, your saved "
+        "phone number, and this chat's history. Your account stays registered. "
+        "Proceed?",
+        reply_markup=kb,
+    )
+
+
+async def reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data != "reset:yes":
+        await query.edit_message_text("Cancelled — nothing was deleted.")
+        return
+    user = update.effective_user
+    tenant = await _fetch_tenant(user.id) if user else None
+    if not tenant:
+        await query.edit_message_text("You're not registered.")
+        return
+    tid = int(tenant["id"])
+    facts = 0
+    try:
+        facts = await _memory.clear_memories(tid)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reset: clear_memories failed: %s", e)
+    old_voice = tenant.get("voice_id")
+    try:
+        await _tenants_db.set_tenant_voice(tid, "", "")
+        if old_voice:
+            await _voices.delete_voice(old_voice)
+    except Exception as e:  # noqa: BLE001
+        log.warning("reset: voice clear failed: %s", e)
+    try:
+        await _tenants_db.set_tenant_phone(tid, "")
+    except Exception as e:  # noqa: BLE001
+        log.warning("reset: phone clear failed: %s", e)
+    context.user_data.pop("chat_history", None)
+    await query.edit_message_text(
+        f"✅ Reset done — removed {facts} fact{'s' if facts != 1 else ''}, your "
+        "voice clone, saved number, and chat history. Send a voice note to "
+        "clone again."
+    )
+
+
+async def checkup(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/checkup` — ask the bridge to verify every dependency (Gradium, LLM,
+    Twilio, public URL, DB) and report a green/red panel. Run before a demo."""
+    await update.message.chat.send_action("typing")
+    try:
+        data = await _bridge_json("GET", "/readyz")
+    except _BridgeDown as e:
+        log.warning("checkup: %s", e)
+        await update.message.reply_text("❌ Couldn't reach the bridge to run the checkup.")
+        return
+    checks = data.get("checks") or {}
+    if not checks:
+        await update.message.reply_text("Checkup returned nothing — bridge may be an old build.")
+        return
+    lines = ["🩺 <b>System checkup</b>"]
+    for name, c in checks.items():
+        ok = c.get("ok")
+        icon = "✅" if ok else "❌"
+        ms = c.get("ms")
+        detail = f" ({ms:.0f}ms)" if isinstance(ms, (int, float)) else ""
+        if not ok and c.get("error"):
+            detail += f" — {html.escape(str(c['error'])[:80])}"
+        lines.append(f"{icon} {html.escape(name)}{detail}")
+    overall = "✅ all systems go" if data.get("ok") else "⚠️ some checks failed"
+    lines.append(f"\n<b>{overall}</b>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/translate` — arm one-shot real-time translation. Pick a target language,
     then send a voice note: I'll speak it back translated, in your cloned voice."""
@@ -706,12 +806,15 @@ async def translate_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, ten
 async def voice_chat_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, tenant: dict) -> None:
     """One round of voice-note conversation with the clone: transcribe → reply
     in the cloned voice → grow memory. The phone-free way to talk to your clone."""
+    import time as _time
     msg = update.message
     await msg.chat.send_action("record_voice")
     try:
         tg_file = await msg.voice.get_file()
         ogg = bytes(await tg_file.download_as_bytearray())
+        _t0 = _time.monotonic()
         user_text = await _voice_chat.transcribe(ogg)
+        stt_ms = (_time.monotonic() - _t0) * 1000
     except Exception as e:  # noqa: BLE001
         log.exception("voice chat: transcription failed")
         await msg.reply_text(f"Sorry, I couldn't hear that ({e}). Try again?")
@@ -722,15 +825,21 @@ async def voice_chat_turn(update: Update, context: ContextTypes.DEFAULT_TYPE, te
 
     history = context.user_data.setdefault("chat_history", [])
     try:
+        _t1 = _time.monotonic()
         answer = await _voice_chat.reply(tenant, history, user_text)
+        llm_ms = (_time.monotonic() - _t1) * 1000
+        _t2 = _time.monotonic()
         ogg_out = await _voice_chat.synthesize(answer, tenant["voice_id"])
+        tts_ms = (_time.monotonic() - _t2) * 1000
     except Exception as e:  # noqa: BLE001
         log.exception("voice chat: reply/synthesis failed")
         await msg.reply_text(f"Hit a snag generating my reply ({e}).")
         return
 
     await msg.reply_voice(voice=ogg_out)
-    await msg.reply_text(f"🗣️ You: {user_text}\n🤖 {answer}")
+    # Latency footer — the Gradium selling point, shown on every voice turn.
+    footer = f"\n\n⧗ STT {stt_ms:.0f}ms · LLM {llm_ms:.0f}ms · TTS {tts_ms:.0f}ms"
+    await msg.reply_text(f"🗣️ You: {user_text}\n🤖 {answer}{footer}")
     try:
         learned = await _voice_chat.learn_from_exchange(int(tenant["id"]), user_text, answer)
         if learned:
@@ -1007,6 +1116,16 @@ async def clone_consent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/voice to inspect, /clear_voice to re-clone.",
         parse_mode="HTML",
     )
+    # Before/after A/B: the same line in a stock voice, then in their clone —
+    # makes the cloning quality immediately obvious.
+    ab_line = "Hi! This is what I sound like. Pretty close, right?"
+    try:
+        default_ogg = await _voice_chat.synthesize(ab_line, _AB_DEFAULT_VOICE_ID)
+        await msg.reply_voice(voice=default_ogg, caption="🔊 A generic Gradium voice")
+        clone_ogg = await _voice_chat.synthesize(ab_line, uid)
+        await msg.reply_voice(voice=clone_ogg, caption="🎯 Your clone — same words")
+    except Exception as e:  # noqa: BLE001
+        log.warning("voice A/B sample failed: %s", e)
 
 
 async def status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1061,6 +1180,10 @@ async def _gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if allowed:
         if uid in allowed:
             return
+        # Log the rejected id so "not authorized" is self-diagnosable — the
+        # usual cause is messaging from a different Telegram account than the
+        # one in ALLOWED_TELEGRAM_IDS.
+        log.warning("gatekeeper denied uid=%s (allowed=%s)", uid, sorted(allowed))
         denied = "Not authorized. This is a personal assistant for its owner only."
     elif os.environ.get("ALLOW_INSECURE_LOCAL", "").strip().lower() in ("1", "true", "yes"):
         return
@@ -1128,16 +1251,36 @@ def main() -> None:
     app.add_handler(CommandHandler("voice", voice_status))
     app.add_handler(CommandHandler("clear_voice", clear_voice))
     app.add_handler(CommandHandler("translate", translate))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("checkup", checkup))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio_sample))
     app.add_handler(MessageHandler(filters.CONTACT, save_contact))
     app.add_handler(CallbackQueryHandler(clone_consent, pattern=r"^clone_consent:"))
     app.add_handler(CallbackQueryHandler(translate_pick_language, pattern=r"^xlate:"))
     app.add_handler(CallbackQueryHandler(oscall_confirm, pattern=r"^oscall:"))
     app.add_handler(CallbackQueryHandler(callme_confirm, pattern=r"^callme:"))
+    app.add_handler(CallbackQueryHandler(reset_confirm, pattern=r"^reset:"))
     app.add_handler(conv)
     # Free-text chat — registered AFTER conv so the /call flow's text steps
     # take precedence while that conversation is active.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_chat))
+
+    async def _post_init(application: Application) -> None:
+        # Populate the Telegram "/" command menu so features are discoverable.
+        await application.bot.set_my_commands([
+            BotCommand("register", "Create your account"),
+            BotCommand("callme", "Have your clone call your phone"),
+            BotCommand("translate", "Hear yourself in another language"),
+            BotCommand("voice", "Voice-clone status"),
+            BotCommand("clear_voice", "Remove your clone (then re-clone)"),
+            BotCommand("history", "Your recent calls"),
+            BotCommand("status", "Live call status"),
+            BotCommand("checkup", "Verify all systems are green"),
+            BotCommand("reset", "Wipe your data (fresh demo)"),
+            BotCommand("web", "Open the web dashboard"),
+            BotCommand("whoami", "Show your Telegram ID"),
+        ])
+    app.post_init = _post_init
 
     log.info("gradphone bot starting against bridge %s", _bridge_url())
     app.run_polling()

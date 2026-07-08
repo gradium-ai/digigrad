@@ -47,6 +47,16 @@ async def add_memory(tenant_id: int, fact: str, *, source: str = "", room: str =
     return True
 
 
+async def clear_memories(tenant_id: int) -> int:
+    """Delete every stored fact for a tenant. Returns the count removed."""
+    rows = await db.fetch_all(
+        "SELECT COUNT(*) AS n FROM memories WHERE tenant_id = :tid", tid=tenant_id
+    )
+    n = int(rows[0]["n"]) if rows else 0
+    await db.execute("DELETE FROM memories WHERE tenant_id = :tid", tid=tenant_id)
+    return n
+
+
 async def get_memories(tenant_id: int, limit: int = _DIGEST_LIMIT) -> list[str]:
     """Most-recent facts first."""
     rows = await db.fetch_all(

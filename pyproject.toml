@@ -1,10 +1,16 @@
 [project]
 name = "gradphone"
-version = "0.3.0"
-description = "Outbound voice agent: Twilio Media Streams + gradbot + multi-tenant SQLite + operator's web switchboard"
+version = "0.4.0"
+description = "Voice-clone agent: Twilio Media Streams + gradbot + Gradium concierge + operator's web switchboard"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "gradbot",
+    # gradbot's compiled core changes silently between releases and every call
+    # runs through it — pin exactly; bump deliberately after a test call.
+    "gradbot==0.1.9",
+    # Used directly (voices.py, bridge TTS renders, voice_chat) — declared
+    # here rather than ridden as gradbot transitives.
+    "gradium>=0.6.0",
+    "numpy>=2.0.0",
     "fastapi>=0.111.0",
     "uvicorn[standard]>=0.29.0",
     "twilio>=9.0.0",
@@ -22,6 +28,12 @@ dependencies = [
     "websockets>=12.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
 [project.scripts]
 gradphone-dial = "gradphone.dial:main"
 gradphone-bot = "gradphone.bot:main"
@@ -32,3 +44,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gradphone"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# Start with correctness-focused rules; expand once the codebase settles.
+select = ["E4", "E7", "E9", "F", "B"]
+ignore = [
+    "B008",  # FastAPI Depends()/File() in defaults is idiomatic
+]
