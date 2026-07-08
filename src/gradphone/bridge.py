@@ -2140,6 +2140,24 @@ async def register(payload: dict) -> dict:
     return {"ok": True, "tenant_id": tenant_id}
 
 
+@app.post("/tenants/{tenant_id}/phone", dependencies=[fastapi.Depends(_require_bearer)])
+async def set_tenant_phone(tenant_id: int, payload: dict) -> dict:
+    """Admin: set (or clear, with "") the tenant's registered phone number.
+
+    Caller-ID routing treats this number as the tenant's identity, so it
+    decides who reaches their own assistant vs. the receptionist/concierge.
+    Normally set by sharing a contact in Telegram; this endpoint covers
+    hosted deployments where the DB isn't otherwise reachable.
+    """
+    row = await tenants.get_tenant_by_id(tenant_id)
+    if not row:
+        return {"ok": False, "error": "no such tenant"}
+    phone = str(payload.get("phone") or "").strip()
+    await tenants.set_tenant_phone(tenant_id, phone)
+    updated = await tenants.get_tenant_by_id(tenant_id)
+    return {"ok": True, "tenant_id": tenant_id, "phone": (updated or {}).get("phone")}
+
+
 async def _register_inbound_call(params: dict) -> str:
     """Build receptionist call state for an inbound call and register it in
     _PENDING. Returns the generated room name to embed in the TwiML stream.
